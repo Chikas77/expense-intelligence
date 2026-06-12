@@ -92,6 +92,71 @@ class ApiFlowTest(unittest.TestCase):
         self.assertEqual(transactions[0].amount, 500)
         self.assertEqual(transactions[1].category, 'airtime')
 
+    def test_parse_mpesa_messages_handles_messy_multi_message_paste(self):
+        from parser import parse_mpesa_messages
+
+        sample = (
+            'UF6AR6NMGC Confirmed. Ksh50.00 paid to SIMON KIHARA NJOROGE. on 6/6/26 at 12:19 PM.New M-PESA balance is Ksh546.37. '
+            'Transaction cost, Ksh0.00. Amount you can transact within the day is 497,560.00. '
+            'Download My OneApp on https://saf.cx/lPKcC '
+            '\n'
+            'UF6AR6NPU4 Confirmed. Ksh160.00 sent to Equity Paybill Account for account 487321 on 6/6/26 at 12:12 PM '
+            'New M-PESA balance is Ksh596.37. Transaction cost, Ksh5.00.Amount you can transact within the day is 497,610.00. '
+            'Download My OneApp on https://saf.cx/kWQpy'
+        )
+
+        transactions = parse_mpesa_messages(sample)
+        self.assertEqual(len(transactions), 2)
+        self.assertEqual(transactions[0].transaction_code, 'UF6AR6NMGC')
+        self.assertAlmostEqual(transactions[0].amount, 50.00)
+        self.assertAlmostEqual(transactions[0].balance, 546.37)
+        self.assertIn('SIMON KIHARA NJOROGE', transactions[0].description)
+
+        self.assertEqual(transactions[1].transaction_code, 'UF6AR6NPU4')
+        self.assertAlmostEqual(transactions[1].amount, 160.00)
+        self.assertAlmostEqual(transactions[1].balance, 596.37)
+        self.assertIn('Equity Paybill', transactions[1].description)
+
+    def test_parse_mpesa_messages_handles_lowercase_confirmed_and_new_balance(self):
+        from parser import parse_mpesa_messages
+
+        sample = (
+            'UF1AR625M4 confirmed.You bought Ksh110.00 of airtime for 0790777315 on 1/6/26 at 9:45 AM.New  balance is Ksh4,983.37. '
+            'Transaction cost, Ksh0.00. Amount you can transact within the day is 499,875.00.You can now access M-PESA via *334#'
+        )
+
+        transactions = parse_mpesa_messages(sample)
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(transactions[0].transaction_code, 'UF1AR625M4')
+        self.assertAlmostEqual(transactions[0].amount, 110.00)
+        self.assertAlmostEqual(transactions[0].balance, 4983.37)
+        self.assertEqual(transactions[0].category, 'airtime')
+        self.assertIn('airtime', transactions[0].description.lower())
+
+    def test_parse_mpesa_messages_endpoint_returns_multiple_transactions(self):
+        payload = {
+            'mpesa_text': (
+                'UF6AR6NMGC Confirmed. Ksh50.00 paid to SIMON KIHARA NJOROGE. on 6/6/26 at 12:19 PM.New M-PESA balance is Ksh546.37. '
+                'Transaction cost, Ksh0.00. Amount you can transact within the day is 497,560.00. '
+                'Download My OneApp on https://saf.cx/lPKcUF6AR6NPU4 Confirmed. Ksh160.00 sent to Equity Paybill Account for account 487321 on 6/6/26 at 12:12 PM '
+                'New M-PESA balance is Ksh596.37. Transaction cost, Ksh5.00.Amount you can transact within the day is 497,610.00. '
+                'Download My OneApp on https://saf.cx/kWQpyUF6AR6NHMJ Confirmed. Ksh140.00 sent to JOSEPH  NYAMBUTU on 6/6/26 at 11:48 AM. '
+                'New M-PESA balance is Ksh761.37. Transaction cost, Ksh7.00. Amount you can transact within the day is 497,770.00. '
+                'Download My OneApp on https://saf.cx/kWQpy'
+            )
+        }
+        response = self.client.post('/parse-mpesa-messages', data=json.dumps(payload), content_type='application/json')
+        self.assertEqual(response.status_code, 200)
+        json_data = response.get_json()
+        self.assertTrue(json_data['success'])
+        self.assertEqual(len(json_data['transactions']), 3)
+        self.assertEqual(json_data['transactions'][0]['transaction_code'], 'UF6AR6NMGC')
+        self.assertEqual(json_data['transactions'][1]['amount'], 160.0)
+        self.assertIn('Equity Paybill', json_data['transactions'][1]['description'])
+        self.assertEqual(json_data['transactions'][2]['transaction_code'], 'UF6AR6NHMJ')
+        self.assertEqual(json_data['transactions'][2]['amount'], 140.0)
+        self.assertIn('JOSEPH', json_data['transactions'][2]['description'])
+
 
 if __name__ == '__main__':
     unittest.main()

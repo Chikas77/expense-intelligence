@@ -6,6 +6,8 @@ from parser import (
     parse_mpesa_pdf,
     parse_mpesa_pdf_all,
     parse_mpesa_sms,
+    parse_mpesa_messages,
+    split_mpesa_messages,
     categorize_transaction_flow,
     Transaction,
 )
@@ -282,9 +284,14 @@ def upload():
             let currentRequestMode = 'json';
             let nextQuestionLevel = null;
             let currentQuestion = null;
+            let currentTransactionLabel = '';
+            let currentTransactionAmount = null;
             let isLoading = false;
             let questionStack = [];
             let answerPath = [];
+            let batchTransactions = [];
+            let currentBatchIndex = -1;
+            let inBatchMode = false;
 
             document.getElementById('start-btn').addEventListener('click', startCategorization);
             document.getElementById('upload-pdf-btn').addEventListener('click', startPdfCategorization);
@@ -302,21 +309,37 @@ def upload():
 
             function startCategorization() {
                 const sms = document.getElementById('sms-text').value.trim();
+                const pdfFile = document.getElementById('pdf-file') && document.getElementById('pdf-file').files[0];
+                // If no SMS provided but a PDF is selected or we have PDF candidates, run PDF batch import
                 if (!sms) {
+                    if (pdfFile) {
+                        // Directly import PDF so Start works immediately without Preview
+                        importAllPdfTransactions();
+                        return;
+                    }
+                    if (Array.isArray(currentPdfCandidates) && currentPdfCandidates.length > 0) {
+                        importAllPdfTransactions();
+                        return;
+                    }
                     showMessage('Please enter an M-Pesa SMS message.');
                     return;
                 }
                 hidePdfPreview();
-                currentEndpoint = '/categorize-with-questions';
+                inBatchMode = true;
+                batchTransactions = [];
+                currentBatchIndex = -1;
+                currentEndpoint = '/parse-mpesa-messages';
                 currentRequestMode = 'json';
                 currentSms = sms;
                 nextQuestionLevel = null;
                 currentQuestion = null;
+                currentTransactionLabel = '';
+                currentTransactionAmount = null;
                 questionStack = [];
                 answerPath = [];
                 document.getElementById('result').style.display = 'none';
                 showMessage('');
-                fetchQuestion({ sms_message: currentSms, answer_path: answerPath }, currentEndpoint, false);
+                fetchQuestion({ mpesa_text: currentSms }, currentEndpoint, false, handleBatchParseResponse);
             }
 
             function startPdfCategorization() {
@@ -330,6 +353,8 @@ def upload():
                 currentRequestMode = 'form';
                 nextQuestionLevel = null;
                 currentQuestion = null;
+                currentTransactionLabel = '';
+                currentTransactionAmount = null;
                 questionStack = [];
                 answerPath = [];
                 document.getElementById('result').style.display = 'none';
@@ -365,16 +390,41 @@ def upload():
 
             function handleCategorizationResponse(data) {
                 if (data.needs_user_input) {
+                    currentTransactionLabel = data.transaction && data.transaction.description ? data.transaction.description : '';
                     if (!data.question || !data.next_question_level) {
                         showMessage('Server returned incomplete question data.');
                         return;
                     }
                     nextQuestionLevel = data.next_question_level;
                     currentQuestion = data.question;
+                    currentTransactionLabel = data.transaction && data.transaction.description ? data.transaction.description : '';
+                    currentTransactionAmount = data.transaction && data.transaction.amount !== undefined ? Number(data.transaction.amount) : null;
                     answerPath = Array.isArray(data.answer_path) ? data.answer_path.slice() : answerPath;
                     showQuestion(data.question);
                     return;
                 }
+
+                if (inBatchMode && currentBatchIndex >= 0) {
+                    const currentTx = batchTransactions[currentBatchIndex];
+                    if (currentTx) {
+                        currentTx.category = data.final_category || currentTx.category;
+                        currentTx.sub_type = data.sub_type || currentTx.sub_type;
+                        currentTx.answer_path = data.answer_path || [];
+                        currentTx.needs_review = false;
+                        currentTx.reviewed = true;
+                    }
+                    currentBatchIndex = findNextReviewIndex(currentBatchIndex + 1);
+                    if (currentBatchIndex >= 0) {
+                        startBatchQuestion(currentBatchIndex);
+                        return;
+                    }
+                    inBatchMode = false;
+                    hideModal();
+                    hidePdfPreview();
+                    showResultBatch(batchTransactions);
+                    return;
+                }
+
                 hideModal();
                 hidePdfPreview();
                 showResult(data);
@@ -397,19 +447,44 @@ def upload():
                 const finalizeBatchButton = document.getElementById('finalize-batch-btn');
                 const batchReview = document.getElementById('pdf-batch-review');
 
-                rawText.textContent = data.raw_text || 'No text extracted from the PDF.';
+                // STRICT TABLE-ONLY PREVIEW: show only formatted table preview.
+                // If no table, show a rendered page image preview (OCR-capable) when available.
+                if (data && data.has_table) {
+                    rawText.textContent = data.table_preview || 'No table preview available.';
+                } else if (data && data.standardized_text) {
+                    // Show cleaned OCR text preview when available
+                    rawText.textContent = data.standardized_text || 'No OCR text available.';
+                } else if (data && data.has_image_preview && data.page_image_preview) {
+                    // Insert or replace an <img> for the PNG preview
+                    let img = document.getElementById('pdf-page-preview-img');
+                    if (!img) {
+                        img = document.createElement('img');
+                        img.id = 'pdf-page-preview-img';
+                        img.style.maxWidth = '100%';
+                        rawText.innerHTML = '';
+                        rawText.appendChild(img);
+                    }
+                    img.src = 'data:image/png;base64,' + data.page_image_preview;
+                } else {
+                    rawText.textContent = 'No table found in PDF (strict table-only preview).';
+                }
                 candidateContainer.innerHTML = '';
                 batchReview.innerHTML = '';
                 batchReview.style.display = 'none';
                 finalizeBatchButton.style.display = 'none';
                 currentBatchTransactions = [];
+                // Candidates only from table extraction (if any)
                 currentPdfCandidates = Array.isArray(data.candidates) ? data.candidates : [];
                 currentPdfCandidate = null;
-
-                if (currentPdfCandidates.length === 0) {
-                    candidateContainer.innerHTML = '<p>No M-Pesa-style transaction lines were found.</p>';
+                if (!data.has_table) {
+                    candidateContainer.innerHTML = '<p>No table found — preview is table-only.</p>';
                     confirmButton.style.display = 'none';
                     importAllButton.style.display = 'none';
+                    document.getElementById('upload-another-btn').style.display = 'inline-block';
+                } else if (currentPdfCandidates.length === 0) {
+                    candidateContainer.innerHTML = '<p>Table found but no parseable M-Pesa rows were detected.</p>';
+                    confirmButton.style.display = 'none';
+                    importAllButton.style.display = 'inline-block';
                     document.getElementById('upload-another-btn').style.display = 'inline-block';
                 } else {
                     currentPdfCandidates.forEach((candidate, index) => {
@@ -494,6 +569,8 @@ def upload():
                 currentRequestMode = 'json';
                 nextQuestionLevel = null;
                 currentQuestion = null;
+                currentTransactionLabel = '';
+                currentTransactionAmount = null;
                 questionStack = [];
                 answerPath = [];
                 fetchQuestion({ sms_message: currentSms, answer_path: answerPath }, currentEndpoint, false);
@@ -543,10 +620,96 @@ def upload():
                 showBatchReview(data);
             }
 
+            function showResultBatch(transactions) {
+                const result = document.getElementById('result');
+                const lines = ['<strong>Batch review complete:</strong>'];
+                transactions.forEach((tx, index) => {
+                    let status = '';
+                    if (tx.dropped) {
+                        status = 'Dropped — Cash inflow (not an expense)';
+                    } else if (tx.needs_review) {
+                        status = 'Needs review';
+                    } else {
+                        status = `Recorded as ${tx.category}${tx.sub_type ? ` (${tx.sub_type})` : ''}`;
+                    }
+                    lines.push(`<strong>Transaction ${index + 1}:</strong> ${tx.description} — Ksh ${Number(tx.amount).toLocaleString()} — ${status}`);
+                });
+                result.innerHTML = lines.join('<br>');
+                result.style.display = 'block';
+            }
+
+            function findNextReviewIndex(startIndex) {
+                for (let i = startIndex; i < batchTransactions.length; i += 1) {
+                    if (batchTransactions[i].needs_review) {
+                        return i;
+                    }
+                }
+                return -1;
+            }
+
+            function startBatchQuestion(index) {
+                const tx = batchTransactions[index];
+                if (!tx) {
+                    return;
+                }
+                currentBatchIndex = index;
+                currentSms = tx.raw_message;
+                currentEndpoint = '/categorize-with-questions';
+                currentRequestMode = 'json';
+                nextQuestionLevel = null;
+                currentQuestion = null;
+                currentTransactionLabel = tx.description || '';
+                currentTransactionAmount = tx.amount !== undefined ? Number(tx.amount) : null;
+                questionStack = [];
+                answerPath = [];
+                document.getElementById('result').style.display = 'none';
+                if (tx.question) {
+                    currentQuestion = tx.question;
+                    nextQuestionLevel = tx.question.question_level;
+                    showQuestion(tx.question);
+                } else {
+                    fetchQuestion({ sms_message: currentSms, answer_path: [] }, currentEndpoint, false);
+                }
+            }
+
+            function showBatchParseSummary(transactions) {
+                const result = document.getElementById('result');
+                const lines = ['<strong>Parsed M-Pesa transactions:</strong>'];
+                transactions.forEach((tx, index) => {
+                    let status = '';
+                    if (tx.dropped) {
+                        status = 'Dropped — Cash inflow (not an expense)';
+                    } else if (tx.needs_review) {
+                        status = 'Needs review';
+                    } else {
+                        status = `Recorded as ${tx.category}${tx.sub_type ? ` (${tx.sub_type})` : ''}`;
+                    }
+                    lines.push(`<strong>${index + 1}.</strong> ${tx.description} — Ksh ${Number(tx.amount).toLocaleString()} — ${status}`);
+                });
+                result.innerHTML = lines.join('<br>');
+                result.style.display = 'block';
+            }
+
+            function handleBatchParseResponse(data) {
+                if (!data.transactions || !Array.isArray(data.transactions)) {
+                    showMessage('Unable to parse M-Pesa messages.');
+                    return;
+                }
+                batchTransactions = data.transactions;
+                showBatchParseSummary(batchTransactions);
+                if (data.first_uncertain_index !== null && data.first_uncertain_index !== undefined) {
+                    startBatchQuestion(data.first_uncertain_index);
+                } else {
+                    inBatchMode = false;
+                    showMessage('All transactions were categorized automatically.');
+                }
+            }
+
             function showBatchReview(data) {
                 const batchReview = document.getElementById('pdf-batch-review');
                 batchReview.innerHTML = '';
                 batchReview.style.display = 'block';
+
                 const title = document.createElement('h3');
                 title.textContent = data.message || 'Review parsed transactions';
                 batchReview.appendChild(title);
@@ -558,11 +721,19 @@ def upload():
                     if (index === 0) {
                         card.classList.add('selected');
                     }
+                    let status = '';
+                    if (tx.dropped) {
+                        status = 'Dropped — Cash inflow (not an expense)';
+                    } else if (tx.needs_review) {
+                        status = 'Needs review';
+                    } else {
+                        status = `Recorded as ${tx.category}${tx.sub_type ? ` (${tx.sub_type})` : ''}`;
+                    }
                     card.innerHTML = `
                         <h4>Transaction ${index + 1}</h4>
                         <p><strong>Amount:</strong> Ksh ${tx.amount.toLocaleString()}</p>
                         <p><strong>Description:</strong> ${tx.description}</p>
-                        <p><strong>Category:</strong> ${tx.category || 'Needs review'}</p>
+                        <p><strong>Status:</strong> ${status}</p>
                         <p><strong>Candidate line:</strong> ${tx.candidate_text || ''}</p>
                     `;
                     list.appendChild(card);
@@ -606,8 +777,17 @@ def upload():
                 .finally(() => setLoading(false));
             }
 
+            function formatKsh(value) {
+                if (value === null || value === undefined || value === '') {
+                    return '';
+                }
+                return `Ksh ${Number(value).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+            }
+
             function showQuestion(questionData) {
-                document.getElementById('question-text').textContent = questionData.question || 'Choose an option below:';
+                const amountLabel = currentTransactionAmount !== null ? ` (${formatKsh(currentTransactionAmount)})` : '';
+                const label = currentTransactionLabel ? ` for "${currentTransactionLabel}"${amountLabel}` : amountLabel;
+                document.getElementById('question-text').textContent = (questionData.question || 'Choose an option below:') + label;
                 const container = document.getElementById('options-container');
                 container.innerHTML = '';
 
@@ -701,18 +881,27 @@ def upload():
                 }
                 if (data.transaction) {
                     lines.push(`<strong>Description:</strong> ${data.transaction.description}`);
+                    if (data.transaction.amount !== undefined) {
+                        lines.push(`<strong>Amount:</strong> Ksh ${Number(data.transaction.amount).toLocaleString()}`);
+                    }
+                    if (data.transaction.balance !== undefined) {
+                        lines.push(`<strong>Balance:</strong> Ksh ${Number(data.transaction.balance).toLocaleString()}`);
+                    }
                 }
                 if (data.confidence !== undefined) {
                     lines.push(`<strong>Confidence:</strong> ${data.confidence}`);
                 }
-            if (data.summary && Array.isArray(data.summary)) {
-                lines.push('<strong>Batch summary:</strong>');
-                data.summary.forEach(item => {
-                    lines.push(item);
-                });
-                if (data.total_spending) {
-                    lines.push(`<strong>Total spending:</strong> ${data.total_spending}`);
+                if (data.summary && Array.isArray(data.summary)) {
+                    lines.push('<strong>Batch summary:</strong>');
+                    data.summary.forEach(item => {
+                        lines.push(item);
+                    });
+                    if (data.total_spending) {
+                        lines.push(`<strong>Total spending:</strong> ${data.total_spending}`);
+                    }
                 }
+                result.innerHTML = lines.join('<br>');
+                result.style.display = 'block';
             }
 
             function hideModal() {
@@ -763,19 +952,6 @@ def predict():
     </body>
     </html>
     """
-
-
-def parse_mpesa_messages(mpesa_text: str):
-    """Parse multiple M-Pesa SMS lines (one per line) into Transaction objects."""
-    if not mpesa_text or not isinstance(mpesa_text, str):
-        return []
-    lines = [line.strip() for line in mpesa_text.splitlines() if line.strip()]
-    transactions = []
-    for line in lines:
-        tx = parse_mpesa_sms(line)
-        if tx is not None:
-            transactions.append(tx)
-    return transactions
 
 
 def calculate_spending_by_category(transactions):
@@ -938,7 +1114,16 @@ def show_categorization_form(obvious_transactions, uncertain_transactions, salar
         </div>
         """
 
-    # include salary fields so finalize can use them
+    # Serialize obvious (auto-categorized) transactions as hidden fields
+    obvious_html = ""
+    for j, transaction in enumerate(obvious_transactions):
+        obvious_html += f"""
+            <input type=\"hidden\" name=\"obvious_{j}_amount\" value=\"{transaction.amount}\">
+            <input type=\"hidden\" name=\"obvious_{j}_description\" value=\"{transaction.description}\">
+            <input type=\"hidden\" name=\"obvious_{j}_category\" value=\"{transaction.category}\">
+            <input type=\"hidden\" name=\"obvious_{j}_balance\" value=\"{transaction.balance}\">
+        """
+
     return f"""
     <!DOCTYPE html>
     <html>
@@ -957,6 +1142,7 @@ def show_categorization_form(obvious_transactions, uncertain_transactions, salar
         
         <form method=\"POST\" action=\"/finalize-categorization\">
             {uncertain_html}
+            {obvious_html}
             <input type=\"hidden\" name=\"salary\" value=\"{salary}\">
             <input type=\"hidden\" name=\"salary_day\" value=\"{salary_day}\">
             <button type=\"submit\">Confirm & Analyze</button>
@@ -979,7 +1165,7 @@ def finalize_categorization():
         salary_day = 1
 
     # Reconstruct user-labeled transactions
-    user_transactions = []
+    all_transactions = []
     i = 0
     while True:
         key_amount = f'transaction_{i}_amount'
@@ -990,12 +1176,26 @@ def finalize_categorization():
         amount = float(form.get(key_amount) or 0)
         desc = form.get(key_desc) or ''
         cat = form.get(key_cat) or 'Other'
-        user_transactions.append(Transaction(amount=amount, description=desc, category=cat, balance=0, timestamp=datetime.now()))
+        all_transactions.append(Transaction(amount=amount, description=desc, category=cat, balance=0, timestamp=datetime.now()))
         i += 1
 
-    # There may be obvious transactions we didn't ask about; try to include them if present in hidden inputs
-    # For simplicity, treat the final set as user_transactions only (could be merged with obvious ones)
-    return show_analysis_results(user_transactions, salary, salary_day)
+    # Reconstruct obvious (auto-categorized) transactions from hidden fields
+    j = 0
+    while True:
+        key_amount = f'obvious_{j}_amount'
+        key_desc = f'obvious_{j}_description'
+        key_cat = f'obvious_{j}_category'
+        key_bal = f'obvious_{j}_balance'
+        if key_amount not in form:
+            break
+        amount = float(form.get(key_amount) or 0)
+        desc = form.get(key_desc) or ''
+        cat = form.get(key_cat) or 'Other'
+        bal = float(form.get(key_bal) or 0)
+        all_transactions.append(Transaction(amount=amount, description=desc, category=cat, balance=bal, timestamp=datetime.now()))
+        j += 1
+
+    return show_analysis_results(all_transactions, salary, salary_day)
 
 
 @app.route('/calculate', methods=['POST'])
@@ -1207,6 +1407,56 @@ def preview_pdf():
         return _api_success(data=data, message='No M-Pesa-style lines were found in the PDF. Please confirm the upload.')
 
     return _api_success(data=data, message='PDF text extracted. Choose the most likely M-Pesa transaction line.')
+
+
+@app.route('/parse-mpesa-messages', methods=['POST'])
+def parse_mpesa_messages_endpoint():
+    request_data = request.get_json(force=True, silent=True) or {}
+    mpesa_text = request_data.get('mpesa_text')
+    if not mpesa_text or not isinstance(mpesa_text, str) or not mpesa_text.strip():
+        return _api_error('mpesa_text is required', 400)
+
+    raw_messages = split_mpesa_messages(mpesa_text)
+    transactions = []
+    first_uncertain_index = None
+    for index, raw in enumerate(raw_messages):
+        transaction = parse_mpesa_sms(raw)
+        if transaction is None:
+            continue
+        category, sub_type, needs_input, question = categorize_transaction_flow(transaction)
+        # If parser detected an incoming/credit, mark as dropped (cash inflow) and skip questions
+        dropped = (transaction.category == 'inflow')
+        if dropped:
+            needs_input = False
+            if first_uncertain_index is None:
+                # treat as not uncertain but still record position
+                pass
+        if needs_input and first_uncertain_index is None:
+            first_uncertain_index = len(transactions)
+        transactions.append({
+            'transaction_code': transaction.transaction_code,
+            'description': transaction.description,
+            'amount': transaction.amount,
+            'balance': transaction.balance,
+            'raw_message': raw,
+            'category': None if dropped else (category if not needs_input else None),
+            'sub_type': None if dropped else (sub_type if not needs_input else None),
+            'needs_review': needs_input,
+            'question': question if needs_input else None,
+            'dropped': bool(dropped),
+            'dropped_reason': 'Cash inflow (not an expense)' if dropped else None,
+        })
+
+    if not transactions:
+        return _api_error('No valid M-Pesa messages found.', 400)
+
+    return _api_success(
+        data={
+            'transactions': transactions,
+            'first_uncertain_index': first_uncertain_index,
+        },
+        message='Parsed M-Pesa transactions successfully',
+    )
 
 
 @app.route('/import-pdf-statement', methods=['POST'])
