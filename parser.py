@@ -2,12 +2,11 @@ import io
 import re
 from datetime import datetime
 from categorization_questions import get_disambiguation_questions, process_answer
-import io
 import base64
-
 import os
 import camelot
 import pypdf
+
 
 def _find_header_and_col_indices(table_rows):
     """
@@ -34,7 +33,7 @@ def _find_header_and_col_indices(table_rows):
                     col_indices['details'] = cell_idx
                 elif 'paid in' in cell_text or ('paid' in cell_text and 'in' in cell_text):
                     col_indices['paid_in'] = cell_idx
-                elif 'withdrawn' in cell_text or 'withdraw' in cell_text:
+                elif 'withdrawn' in cell_text or 'withdraw' in cell_text or 'paid out' in cell_text:
                     col_indices['withdrawn'] = cell_idx
                 elif 'balance' in cell_text:
                     col_indices['balance'] = cell_idx
@@ -52,6 +51,7 @@ class Transaction:
         self.balance = balance
         self.timestamp = timestamp
         self.transaction_code = transaction_code
+        self.candidate_text = description
 
     def __repr__(self):
         return (
@@ -61,7 +61,11 @@ class Transaction:
 
 
 def _parse_amount(value: str) -> float:
-    return float(value.replace(',', ''))
+    """Parse amount string, handling commas, negative signs, and empty values."""
+    cleaned = value.replace(',', '').replace('-', '').strip()
+    if not cleaned:
+        raise ValueError(f"Empty amount: {value!r}")
+    return float(cleaned)
 
 
 # M-Pesa transaction codes: 10 alphanumeric chars, typically at the start of SMS
@@ -119,7 +123,6 @@ def parse_mpesa_sms(message: str):
         return None
 
     lower_desc = description_text.lower()
-    # Incoming / credit to account
     if re.search(r'\b(received|credited|you have received|you received|paid to you|credited to)\b', lower_desc):
         category = 'inflow'
     elif re.search(r'\b(airtime|bundle|data|sms)\b', lower_desc):
@@ -293,19 +296,38 @@ def extract_text_from_pdf_bytes(pdf_bytes):
     return _extract_text_from_pdf_bytes(pdf_bytes)
 
 
+def _categorize_from_description(description: str, is_inflow: bool) -> str:
+    """Determine transaction category from description text."""
+    if is_inflow:
+        return 'inflow'
+    lower = description.lower()
+    # Fuliza overdraft marker (zero-amount) or repayment (has amount)
+    if 'overdraft' in lower or 'od loan' in lower or 'fuliza' in lower:
+        return 'fuliza'
+    # Transaction/withdrawal charges
+    if 'charge' in lower or 'transaction cost' in lower or 'fee' in lower:
+        return 'charge'
+    # Airtime/data
+    if re.search(r'\b(airtime|bundle|data|sms)\b', lower):
+        return 'airtime'
+    # All outflows: transfers, payments, buy goods, paybill, withdrawals
+    if re.search(
+        r'\b(sent|paid|transfer|paybill|till|deposit|withdrawal|withdraw|merchant|buy goods|lipa|customer payment|funds|payment)\b',
+        lower
+    ):
+        return 'expense'
+    return 'other'
+
+
 def extract_mpesa_statement_pdf(pdf_bytes):
-    """
-    Extract transactions from a structured M-PESA statement PDF (table format) using Camelot.
-    Returns list of Transaction objects.
-    """
+    """Extract transactions from a structured M-PESA statement PDF using Camelot."""
     if not isinstance(pdf_bytes, (bytes, bytearray)):
         return []
-    
+
     temp_filename = f"temp_statement_{os.getpid()}.pdf"
     try:
         with open(temp_filename, "wb") as f:
             f.write(pdf_bytes)
-        
         tables = camelot.read_pdf(temp_filename, pages='all', flavor='stream')
     except Exception as e:
         print(f"Camelot extraction failed: {e}")
@@ -329,8 +351,20 @@ def extract_mpesa_statement_pdf(pdf_bytes):
         if header_idx is None or col_indices is None:
             continue
 
+        # Guard: determine minimum columns needed
+        valid_indices = [v for v in col_indices.values() if v is not None]
+        if not valid_indices:
+            continue
+        min_cols_needed = max(valid_indices) + 1
+
         for row in rows[header_idx + 1:]:
-            if len(row) <= max(col_indices.values()):
+            # Short row = continuation of previous transaction
+            if len(row) < min_cols_needed:
+                if current_tx:
+                    extra = ' '.join(str(c).strip() for c in row if str(c).strip())
+                    if extra:
+                        current_tx.description = f"{current_tx.description} {extra}".strip()
+                        current_tx.candidate_text = current_tx.description
                 continue
 
             receipt_no = row[col_indices['receipt']].strip() if col_indices['receipt'] is not None else ''
@@ -343,14 +377,14 @@ def extract_mpesa_statement_pdf(pdf_bytes):
                 amount = 0.0
                 is_inflow = False
 
-                if paid_in_str and paid_in_str != '-':
+                if paid_in_str and paid_in_str not in ('-', ''):
                     try:
                         amount = _parse_amount(paid_in_str)
                         is_inflow = True
                     except ValueError:
                         pass
-                
-                if amount == 0.0 and withdrawn_str and withdrawn_str != '-':
+
+                if amount == 0.0 and withdrawn_str and withdrawn_str not in ('-', ''):
                     try:
                         amount = abs(_parse_amount(withdrawn_str))
                         is_inflow = False
@@ -362,16 +396,13 @@ def extract_mpesa_statement_pdf(pdf_bytes):
                 except ValueError:
                     balance = 0.0
 
-                if is_inflow:
-                    category = 'inflow'
-                else:
-                    lower_desc = details.lower()
-                    if re.search(r'\b(airtime|bundle|data|sms)\b', lower_desc):
-                        category = 'airtime'
-                    elif re.search(r'\b(sent|paid|paid to|transfer|paybill|till|deposit|withdrawal|withdraw)\b', lower_desc):
-                        category = 'expense'
-                    else:
-                        category = 'other'
+                # OverDraft of Credit Party: M-PESA puts Fuliza credit in Balance column
+                # Real wallet balance = 0, the balance value = the debt/expense taken
+                if 'overdraft' in details.lower():
+                    amount = balance  # Fuliza credit extended = the liability
+                    balance = 0.0
+
+                category = _categorize_from_description(details, is_inflow)
 
                 current_tx = Transaction(
                     amount=amount,
@@ -381,13 +412,15 @@ def extract_mpesa_statement_pdf(pdf_bytes):
                     timestamp=datetime.now(),
                     transaction_code=receipt_no,
                 )
-                current_tx.candidate_text = details
                 transactions.append(current_tx)
 
-            elif not receipt_no and details and current_tx:
-                current_tx.description = f"{current_tx.description} {details}"
-                current_tx.candidate_text = current_tx.description
-            elif not details:
+            elif not receipt_no and current_tx:
+                # Continuation row — append detail fragment
+                if details:
+                    current_tx.description = f"{current_tx.description} {details}".strip()
+                    current_tx.candidate_text = current_tx.description
+
+            elif not details and not receipt_no:
                 current_tx = None
 
     return transactions
@@ -539,7 +572,6 @@ def categorize_transaction_kenya(transaction):
 
     new_category = 'Other'
 
-    # Transfer-specific refinements
     if transaction.category == 'transfer':
         if contains_any(description, informal_tax_keywords):
             new_category = 'Informal Tax'
@@ -550,7 +582,6 @@ def categorize_transaction_kenya(transaction):
         else:
             new_category = 'Other'
 
-    # Expense-specific refinements
     elif transaction.category == 'expense':
         if contains_any(description, food_keywords):
             new_category = 'Food'
@@ -563,12 +594,8 @@ def categorize_transaction_kenya(transaction):
         else:
             new_category = 'Other'
 
-    # Airtime stays Airtime, with extra Kenyan telcom keyword support
     elif transaction.category == 'airtime':
-        if contains_any(description, airtime_keywords):
-            new_category = 'Airtime'
-        else:
-            new_category = 'Airtime'
+        new_category = 'Airtime'
 
     else:
         new_category = transaction.category.title() if transaction.category else 'Other'
@@ -646,4 +673,3 @@ def categorize_transaction_flow(transaction, previous_level=None, user_answer=No
         return continue_categorization_with_questions(previous_level, user_answer)
 
     return categorize_transaction_with_questions(transaction)
-
