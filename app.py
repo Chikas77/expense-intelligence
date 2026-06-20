@@ -1,4 +1,4 @@
-﻿import json
+import json
 from flask import Flask, request, jsonify
 from datetime import datetime
 from parser import (
@@ -1401,6 +1401,8 @@ def preview_pdf():
     data = {
         'raw_text': preview['raw_text'],
         'candidates': preview['parseable'],
+        'has_table': preview.get('has_table', False),
+        'table_preview': preview.get('table_preview', ''),
     }
     if not preview['candidates']:
         data['candidates'] = []

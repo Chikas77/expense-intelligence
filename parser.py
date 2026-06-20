@@ -6,6 +6,7 @@ import base64
 import os
 import camelot
 import pypdf
+import uuid
 
 
 def _find_header_and_col_indices(table_rows):
@@ -324,7 +325,7 @@ def extract_mpesa_statement_pdf(pdf_bytes):
     if not isinstance(pdf_bytes, (bytes, bytearray)):
         return []
 
-    temp_filename = f"temp_statement_{os.getpid()}.pdf"
+    temp_filename = os.path.abspath(f"temp_statement_{os.getpid()}_{uuid.uuid4().hex}_extract.pdf").replace('\\', '/')
     try:
         with open(temp_filename, "wb") as f:
             f.write(pdf_bytes)
@@ -340,14 +341,17 @@ def extract_mpesa_statement_pdf(pdf_bytes):
                 pass
 
     if not tables:
+        print("Camelot found 0 tables in the PDF statement")
         return []
 
+    print(f"Camelot found {len(tables)} tables. Parsing rows...")
     transactions = []
     current_tx = None
 
-    for table in tables:
+    for table_idx, table in enumerate(tables):
         rows = table.df.values.tolist()
         header_idx, col_indices = _find_header_and_col_indices(rows)
+        print(f"Table {table_idx}: rows={len(rows)}, header_idx={header_idx}, col_indices={col_indices}")
         if header_idx is None or col_indices is None:
             continue
 
@@ -423,6 +427,7 @@ def extract_mpesa_statement_pdf(pdf_bytes):
             elif not details and not receipt_no:
                 current_tx = None
 
+    print(f"Successfully extracted {len(transactions)} transactions")
     return transactions
 
 
@@ -449,21 +454,28 @@ def extract_mpesa_pdf_candidates(pdf_bytes):
         })
 
     table_preview = ''
-    temp_filename = f"temp_statement_{os.getpid()}.pdf"
+    temp_filename = os.path.abspath(f"temp_statement_{os.getpid()}_{uuid.uuid4().hex}_preview.pdf").replace('\\', '/')
     try:
         with open(temp_filename, "wb") as f:
             f.write(pdf_bytes)
-        tables = camelot.read_pdf(temp_filename, pages='1', flavor='stream')
-        if tables:
-            transaction_table = None
-            for table in tables:
-                rows = table.df.values.tolist()
-                header_idx, col_indices = _find_header_and_col_indices(rows)
-                if header_idx is not None:
-                    transaction_table = rows
-                    break
-            if transaction_table:
-                table_preview = _format_table_preview_from_table(transaction_table, max_rows=12)
+        
+        # Scan page by page (up to page 3) for the preview to avoid parsing the whole document twice
+        for pg in ['1', '2', '3']:
+            try:
+                tables = camelot.read_pdf(temp_filename, pages=pg, flavor='stream')
+                if tables:
+                    transaction_table = None
+                    for table in tables:
+                        rows = table.df.values.tolist()
+                        header_idx, col_indices = _find_header_and_col_indices(rows)
+                        if header_idx is not None:
+                            transaction_table = rows
+                            break
+                    if transaction_table:
+                        table_preview = _format_table_preview_from_table(transaction_table, max_rows=12)
+                        break
+            except Exception:
+                pass
     except Exception:
         pass
     finally:
