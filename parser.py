@@ -44,6 +44,61 @@ def _find_header_and_col_indices(table_rows):
     return None, None
 
 
+def get_clean_recipient_name(description: str) -> str:
+    if not description:
+        return ""
+    
+    desc = re.sub(r'\s+', ' ', description).strip()
+    
+    # 1. Paybill pattern: "Pay Bill [Fuliza M-Pesa ]to <digits> - <Name> Acc. <acc>"
+    paybill_match = re.search(
+        r'Pay\s*Bill\s*(?:Fuliza\s*M-Pesa\s*)?to\s+\d+\s*-\s*(.+?)(?:\s+Acc\.?\s+\S+|$)',
+        desc,
+        re.IGNORECASE
+    )
+    if paybill_match:
+        return paybill_match.group(1).strip().rstrip('.')
+
+    # 2. Merchant Payment pattern: "Merchant Payment [Fuliza M-Pesa ]to <digits> - <Name>"
+    merchant_match = re.search(
+        r'Merchant\s*Payment\s*(?:Fuliza\s*M-Pesa\s*)?to\s+\d+\s*-\s*(.+)',
+        desc,
+        re.IGNORECASE
+    )
+    if merchant_match:
+        return merchant_match.group(1).strip().rstrip('.')
+
+    # 3. Small Business / Send Money / Transfer pattern:
+    transfer_match = re.search(
+        r'(?:to|from)\s*-\s*(?:\+?\d+)?\**\d*\s+(.+)',
+        desc,
+        re.IGNORECASE
+    )
+    if transfer_match:
+        return transfer_match.group(1).strip().rstrip('.')
+
+    # Fallback cleaning: remove common prefixes
+    clean = desc
+    prefixes = [
+        r'^Customer Payment to Small Business to\s+-\s+\S+\s+',
+        r'^Customer Transfer to\s+-\s+\S+\s+',
+        r'^Customer Send Money to Micro SME Business with Fuliza MPesa to\s+-\s+\S+\s+',
+        r'^Funds received from\s+-\s+\S+\s+',
+        r'^Merchant Payment to\s+\S+\s+-\s+',
+        r'^Pay Bill to\s+\S+\s+-\s+',
+    ]
+    for prefix in prefixes:
+        clean = re.sub(prefix, '', clean, flags=re.IGNORECASE)
+
+    # Strip any leading "Fuliza" words/prefixes from the final clean name
+    clean = re.sub(r'^(?:Fuliza\s*(?:M-?Pesa|MPesa)?\s*(?:to)?\s*)+', '', clean, flags=re.IGNORECASE).strip()
+
+    # Strip trailing "Completed" word if present
+    clean = re.sub(r'\bCompleted\b.*$', '', clean, flags=re.IGNORECASE).strip()
+
+    return clean.strip().rstrip('.')
+
+
 class Transaction:
     def __init__(self, amount: float, description: str, category: str, balance: float, timestamp: datetime, transaction_code: str = None):
         self.amount = amount
@@ -53,12 +108,15 @@ class Transaction:
         self.timestamp = timestamp
         self.transaction_code = transaction_code
         self.candidate_text = description
+        self.clean_name = get_clean_recipient_name(description)
+        self.is_inflow = (category == 'inflow')
+        self.is_repayment = ('overdraft' in description.lower() or 'od loan' in description.lower() or 'fuliza' in description.lower()) and ('repay' in description.lower() or 'repayment' in description.lower())
 
     def __repr__(self):
         return (
             f"Transaction(amount={self.amount}, description={self.description!r}, "
             f"category={self.category!r}, balance={self.balance}, timestamp={self.timestamp!r}, "
-            f"transaction_code={self.transaction_code!r})")
+            f"transaction_code={self.transaction_code!r}, clean_name={self.clean_name!r})")
 
 
 def _parse_amount(value: str) -> float:
@@ -124,16 +182,20 @@ def parse_mpesa_sms(message: str):
         return None
 
     lower_desc = description_text.lower()
-    if re.search(r'\b(received|credited|you have received|you received|paid to you|credited to)\b', lower_desc):
+    is_inflow = False
+    if re.search(r'\b(received|credited|you have received|you received|paid to you|credited to|sent you|sent by.+to you)\b', lower_desc) or 'funds received' in lower_desc:
         category = 'inflow'
+        is_inflow = True
     elif re.search(r'\b(airtime|bundle|data|sms)\b', lower_desc):
         category = 'airtime'
-    elif re.search(r'\b(sent|paid|paid to|transfer|paybill|till|deposit|withdrawal|withdraw)\b', lower_desc):
+    elif re.search(r'\b(sent|transfer)\b', lower_desc):
+        category = 'transfer'
+    elif re.search(r'\b(paid|paid to|paybill|till|deposit|withdrawal|withdraw)\b', lower_desc):
         category = 'expense'
     else:
         category = 'other'
 
-    return Transaction(
+    tx = Transaction(
         amount=amount,
         description=description_text,
         category=category,
@@ -141,6 +203,8 @@ def parse_mpesa_sms(message: str):
         timestamp=datetime.now(),
         transaction_code=transaction_code,
     )
+    tx.is_inflow = is_inflow
+    return tx
 
 
 def split_mpesa_messages(text):
@@ -313,7 +377,12 @@ def _categorize_from_description(description: str, is_inflow: bool) -> str:
         return 'airtime'
     # All outflows: transfers, payments, buy goods, paybill, withdrawals
     if re.search(
-        r'\b(sent|paid|transfer|paybill|till|deposit|withdrawal|withdraw|merchant|buy goods|lipa|customer payment|funds|payment)\b',
+        r'\b(sent|transfer)\b',
+        lower
+    ):
+        return 'transfer'
+    if re.search(
+        r'\b(paid|paybill|till|deposit|withdrawal|withdraw|merchant|buy goods|lipa|customer payment|funds|payment)\b',
         lower
     ):
         return 'expense'
@@ -369,13 +438,37 @@ def extract_mpesa_statement_pdf(pdf_bytes):
                     if extra:
                         current_tx.description = f"{current_tx.description} {extra}".strip()
                         current_tx.candidate_text = current_tx.description
+                        current_tx.clean_name = get_clean_recipient_name(current_tx.description)
                 continue
 
             receipt_no = row[col_indices['receipt']].strip() if col_indices['receipt'] is not None else ''
             details = row[col_indices['details']].strip() if col_indices['details'] is not None else ''
-            paid_in_str = row[col_indices['paid_in']].strip() if col_indices['paid_in'] is not None else ''
-            withdrawn_str = row[col_indices['withdrawn']].strip() if col_indices['withdrawn'] is not None else ''
-            balance_str = row[col_indices['balance']].strip() if col_indices['balance'] is not None else ''
+            
+            # Helper to read column value, falling back to next column if it is empty and has no header
+            def get_col_val(col_name):
+                idx = col_indices[col_name]
+                if idx is None:
+                    return ""
+                val = row[idx].strip()
+                if not val:
+                    # Check if next column exists and is unlabeled
+                    next_idx = idx + 1
+                    if next_idx < len(row):
+                        if next_idx not in col_indices.values():
+                            val = row[next_idx].strip()
+                return val
+
+            paid_in_str = get_col_val('paid_in')
+            withdrawn_str = get_col_val('withdrawn')
+            balance_str = get_col_val('balance')
+            time_str = row[col_indices['time']].strip() if col_indices['time'] is not None else ''
+
+            timestamp = datetime.now()
+            if time_str:
+                try:
+                    timestamp = datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S')
+                except ValueError:
+                    pass
 
             if receipt_no and details:
                 amount = 0.0
@@ -400,11 +493,10 @@ def extract_mpesa_statement_pdf(pdf_bytes):
                 except ValueError:
                     balance = 0.0
 
-                # OverDraft of Credit Party: M-PESA puts Fuliza credit in Balance column
-                # Real wallet balance = 0, the balance value = the debt/expense taken
-                if 'overdraft' in details.lower():
-                    amount = balance  # Fuliza credit extended = the liability
-                    balance = 0.0
+                # Skip the overdraft funding credit line completely as it is already accounted for by negative balances
+                if 'overdraft' in details.lower() and 'repay' not in details.lower() and 'repayment' not in details.lower():
+                    current_tx = None
+                    continue
 
                 category = _categorize_from_description(details, is_inflow)
 
@@ -413,9 +505,10 @@ def extract_mpesa_statement_pdf(pdf_bytes):
                     description=details,
                     category=category,
                     balance=balance,
-                    timestamp=datetime.now(),
+                    timestamp=timestamp,
                     transaction_code=receipt_no,
                 )
+                current_tx.is_inflow = is_inflow
                 transactions.append(current_tx)
 
             elif not receipt_no and current_tx:
@@ -423,12 +516,51 @@ def extract_mpesa_statement_pdf(pdf_bytes):
                 if details:
                     current_tx.description = f"{current_tx.description} {details}".strip()
                     current_tx.candidate_text = current_tx.description
+                    current_tx.clean_name = get_clean_recipient_name(current_tx.description)
+                    current_tx.is_repayment = ('overdraft' in current_tx.description.lower() or 'od loan' in current_tx.description.lower() or 'fuliza' in current_tx.description.lower()) and ('repay' in current_tx.description.lower() or 'repayment' in current_tx.description.lower())
+
+                # Extract amount and balance if present on continuation rows (crucial for multi-line transactions)
+                if paid_in_str and paid_in_str not in ('-', ''):
+                    try:
+                        current_tx.amount = _parse_amount(paid_in_str)
+                        current_tx.is_inflow = True
+                        current_tx.category = 'inflow'
+                    except ValueError:
+                        pass
+                elif withdrawn_str and withdrawn_str not in ('-', ''):
+                    try:
+                        current_tx.amount = abs(_parse_amount(withdrawn_str))
+                        current_tx.is_inflow = False
+                        current_tx.category = _categorize_from_description(current_tx.description, False)
+                    except ValueError:
+                        pass
+
+                if balance_str and balance_str not in ('-', ''):
+                    try:
+                        current_tx.balance = _parse_amount(balance_str)
+                    except ValueError:
+                        pass
 
             elif not details and not receipt_no:
                 current_tx = None
 
-    print(f"Successfully extracted {len(transactions)} transactions")
-    return transactions
+    filtered_transactions = []
+    for tx in transactions:
+        desc = tx.description.lower()
+        if 'overdraft' in desc and 'repay' not in desc and 'repayment' not in desc:
+            continue
+        filtered_transactions.append(tx)
+
+    # Assign original top-to-bottom index in PDF to preserve order for simultaneous transactions
+    for idx, tx in enumerate(filtered_transactions):
+        tx.orig_idx = idx
+
+    # The PDF is sorted reverse-chronologically (newest first). Reversing the list
+    # makes it chronological (oldest first) while keeping identical timestamps correctly ordered.
+    filtered_transactions.reverse()
+
+    print(f"Successfully extracted {len(filtered_transactions)} transactions")
+    return filtered_transactions
 
 
 def extract_mpesa_pdf_candidates(pdf_bytes):
@@ -626,6 +758,14 @@ def categorize_transaction_with_questions(transaction):
 
     description = (getattr(transaction, 'description', '') or '').lower()
 
+    # 1. Auto-categorize transaction costs / charges
+    if any(k in description for k in ['charge', 'transaction cost', 'withdrawal fee', 'funds charge']):
+        return ('Transaction Cost', None, False, None)
+
+    # 2. Auto-categorize Fuliza / loan repayment
+    if 'repay' in description or 'repayment' in description:
+        return ('Personal-Loan', 'Loan repayment', False, None)
+
     obvious_keywords = {
         'airtime': 'Airtime',
         'safaricom': 'Airtime',
@@ -645,13 +785,26 @@ def categorize_transaction_with_questions(transaction):
         'water': 'Utilities',
         'wifi': 'Utilities',
         'internet': 'Utilities',
+        'soap': 'Inventories and Supplies',
+        'deodorant': 'Inventories and Supplies',
+        'book': 'Inventories and Supplies',
+        'phone': 'Inventories and Supplies',
+        'furniture': 'Inventories and Supplies',
     }
 
     for keyword, category in obvious_keywords.items():
         if keyword in description:
             return (category, None, False, None)
 
-    first_question = get_disambiguation_questions(transaction)
+    # 3. Choose starting node based on transaction details
+    is_payment = any(keyword in description for keyword in ['merchant payment', 'small business', 'pay bill', 'paybill', 'till', 'buy goods'])
+
+    if is_payment:
+        start_node = '2B'
+    else:
+        start_node = '1'
+
+    first_question = get_disambiguation_questions(transaction, start_node)
     return (None, None, True, first_question)
 
 

@@ -1,0 +1,2418 @@
+diff --git a/app.py b/app.py
+index 0e1a690..2854d84 100644
+--- a/app.py
++++ b/app.py
+@@ -17,14 +17,51 @@ app = Flask(__name__)
+ 
+ 
+ def _build_transaction_payload(transaction):
++    ts_str = transaction.timestamp.strftime('%Y-%m-%d %H:%M:%S') if transaction.timestamp else ''
+     return {
++        'transaction_code': transaction.transaction_code,
+         'description': transaction.description,
+         'amount': transaction.amount,
+         'category': transaction.category,
+         'balance': transaction.balance,
++        'timestamp': ts_str,
++        'clean_name': getattr(transaction, 'clean_name', ''),
++        'is_inflow': getattr(transaction, 'is_inflow', False),
+     }
+ 
+ 
++def process_and_deduplicate_transactions(transactions):
++    if not transactions:
++        return []
++
++    # Sort chronologically ascending
++    transactions = sorted(transactions, key=lambda x: x.timestamp or datetime.min)
++
++    seen = set()
++    deduped = []
++    for tx in transactions:
++        tx_code = tx.transaction_code or ''
++        amt = tx.amount
++        ts_str = tx.timestamp.strftime('%Y-%m-%d %H:%M:%S') if tx.timestamp else ''
++        key = (tx_code, amt, ts_str)
++        if key not in seen:
++            seen.add(key)
++            deduped.append(tx)
++
++    # Recompute running balance forward
++    if deduped:
++        running_balance = deduped[0].balance
++        for i in range(1, len(deduped)):
++            tx = deduped[i]
++            if tx.category == 'inflow':
++                running_balance += tx.amount
++            else:
++                running_balance -= tx.amount
++            tx.balance = running_balance
++
++    return deduped
++
++
+ def _api_success(data=None, message=None, status_code=200, **extra):
+     payload = {'success': True}
+     if message is not None:
+@@ -216,711 +253,1538 @@ def show_pages_detailed():
+     </body>
+     </html>
+     """
+-    
++
+ @app.route('/upload')
+ def upload():
+     return """
+-    <!DOCTYPE html>
+-    <html>
+-    <head>
+-        <meta charset="utf-8">
+-        <title>M-Pesa Upload</title>
+-        <style>
+-            body { font-family: Arial, sans-serif; margin: 24px; max-width: 900px; }
+-            textarea { width: 100%; min-height: 140px; padding: 12px; font-size: 15px; margin-bottom: 16px; }
+-            button { font-size: 15px; padding: 10px 18px; margin-right: 10px; }
+-            .message { margin: 14px 0; color: #b00020; }
+-            .result { margin-top: 18px; padding: 16px; background: #eef9f2; border: 1px solid #b8e4c5; }
+-            #categorization-modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.45); align-items: center; justify-content: center; }
+-            .modal-content { background: #fff; border-radius: 8px; max-width: 720px; width: 100%; padding: 22px; box-shadow: 0 18px 40px rgba(0,0,0,0.18); }
+-            .candidate-card { border: 1px solid #ddd; padding: 12px; border-radius: 8px; margin-bottom: 10px; background: #fafafa; }
+-            .candidate-card.selected { border-color: #2E75B6; background: #eef4ff; }
+-            .candidate-card h4 { margin: 0 0 6px 0; font-size: 15px; }
+-            .candidate-card p { margin: 5px 0; }
+-            #options-container label { display: block; margin: 10px 0; cursor: pointer; }
+-            #options-container input { margin-right: 10px; }
+-            .button-row { margin-top: 20px; display: flex; gap: 12px; }
+-        </style>
+-    </head>
+-    <body>
+-        <h1>M-Pesa Upload</h1>
+-        <p>Paste an M-Pesa SMS and answer the follow-up questions to classify the transaction.</p>
+-
+-        <textarea id="sms-text" placeholder="Paste M-Pesa SMS here"></textarea>
+-        <br>
+-        <button id="start-btn" type="button">Start Categorization</button>
+-        <button id="upload-pdf-btn" type="button">Preview PDF Text</button>
+-        <input id="pdf-file" type="file" accept="application/pdf" style="display:block; margin-top:12px;" />
+-        <div id="message" class="message"></div>
+-        <div id="pdf-preview" class="result" style="display: none; white-space: pre-wrap;">
+-            <h3>PDF Text Preview</h3>
+-            <div id="pdf-raw-text" style="white-space: pre-wrap; max-height: 240px; overflow: auto; background: #fff; border: 1px solid #ccc; padding: 12px; margin-bottom: 12px;"></div>
+-            <div id="pdf-candidates" style="margin-bottom: 12px;"></div>
+-            <div style="display:flex; gap:10px; align-items:center; margin-top:8px; flex-wrap: wrap;">
+-                <button id="confirm-pdf-btn" type="button" style="display: none;">Confirm Candidate and Categorize</button>
+-                <button id="import-all-btn" type="button" style="display: none;">Import All Parsed Transactions</button>
+-                <button id="finalize-batch-btn" type="button" style="display: none;">Finalize Statement Import</button>
+-                <button id="upload-another-btn" type="button" style="display: none;">Upload Another PDF</button>
++<!DOCTYPE html>
++<html lang="en">
++<head>
++    <meta charset="utf-8">
++    <meta name="viewport" content="width=device-width, initial-scale=1.0">
++    <title>Expense Intelligence - M-Pesa Upload</title>
++    <style>
++        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
++        
++        :root {
++            --bg-main: #090d16;
++            --bg-card: #111827;
++            --bg-card-hover: #1f2937;
++            --border-color: #374151;
++            --text-primary: #f9fafb;
++            --text-secondary: #9ca3af;
++            --primary: #4f46e5;
++            --primary-hover: #4338ca;
++            --primary-light: rgba(79, 70, 229, 0.1);
++            --success: #10b981;
++            --success-light: rgba(16, 185, 129, 0.1);
++            --danger: #ef4444;
++            --danger-light: rgba(239, 68, 68, 0.1);
++            --warning: #f59e0b;
++            --warning-light: rgba(245, 158, 11, 0.1);
++            --purple: #8b5cf6;
++            --purple-light: rgba(139, 92, 246, 0.1);
++        }
++
++        * {
++            box-sizing: border-box;
++        }
++
++        body {
++            font-family: 'Inter', sans-serif;
++            background: var(--bg-main);
++            color: var(--text-primary);
++            margin: 0;
++            padding: 0;
++            min-height: 100vh;
++        }
++
++        /* Nav Bar */
++        .navbar {
++            background: rgba(17, 24, 39, 0.8);
++            backdrop-filter: blur(12px);
++            border-bottom: 1px solid var(--border-color);
++            position: sticky;
++            top: 0;
++            z-index: 100;
++        }
++        .nav-container {
++            max-width: 1200px;
++            margin: 0 auto;
++            display: flex;
++            justify-content: space-between;
++            align-items: center;
++            padding: 1rem 2rem;
++        }
++        .nav-logo {
++            font-size: 1.25rem;
++            font-weight: 700;
++            color: var(--text-primary);
++            text-decoration: none;
++            display: flex;
++            align-items: center;
++            gap: 0.5rem;
++        }
++        .nav-links {
++            display: flex;
++            gap: 1.5rem;
++        }
++        .nav-link {
++            color: var(--text-secondary);
++            text-decoration: none;
++            font-weight: 500;
++            font-size: 0.9rem;
++            transition: color 0.2s;
++        }
++        .nav-link:hover, .nav-link.active {
++            color: var(--text-primary);
++        }
++
++        /* Container */
++        .container {
++            max-width: 1200px;
++            margin: 2rem auto;
++            padding: 0 2rem;
++        }
++
++        /* Header */
++        .header {
++            margin-bottom: 2.5rem;
++            text-align: center;
++        }
++        .header h1 {
++            font-size: 2.5rem;
++            font-weight: 800;
++            margin: 0 0 0.5rem 0;
++            background: linear-gradient(to right, #818cf8, #c084fc);
++            -webkit-background-clip: text;
++            -webkit-text-fill-color: transparent;
++        }
++        .header p {
++            color: var(--text-secondary);
++            font-size: 1.1rem;
++            margin: 0;
++        }
++
++        /* Grid */
++        .dashboard-grid {
++            display: grid;
++            grid-template-columns: 380px 1fr;
++            gap: 2rem;
++        }
++        @media (max-width: 900px) {
++            .dashboard-grid {
++                grid-template-columns: 1fr;
++            }
++        }
++
++        /* Cards */
++        .panel-card {
++            background: var(--bg-card);
++            border: 1px solid var(--border-color);
++            border-radius: 16px;
++            padding: 1.75rem;
++            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
++        }
++
++        /* Tabs */
++        .tab-buttons {
++            display: flex;
++            border-bottom: 1px solid var(--border-color);
++            margin-bottom: 1.5rem;
++            gap: 1rem;
++        }
++        .tab-btn {
++            background: none;
++            border: none;
++            color: var(--text-secondary);
++            padding: 0.5rem 0.25rem 0.75rem 0.25rem;
++            font-weight: 600;
++            font-size: 0.95rem;
++            cursor: pointer;
++            border-bottom: 2px solid transparent;
++            transition: color 0.2s, border-color 0.2s;
++        }
++        .tab-btn:hover {
++            color: var(--text-primary);
++        }
++        .tab-btn.active {
++            color: #818cf8;
++            border-bottom-color: #818cf8;
++        }
++        .tab-content {
++            display: none;
++        }
++        .tab-content.active {
++            display: block;
++        }
++
++        /* Inputs */
++        textarea {
++            width: 100%;
++            min-height: 150px;
++            background: var(--bg-main);
++            border: 1px solid var(--border-color);
++            border-radius: 8px;
++            color: var(--text-primary);
++            padding: 0.75rem;
++            font-family: inherit;
++            font-size: 0.95rem;
++            resize: vertical;
++            outline: none;
++            transition: border-color 0.2s, box-shadow 0.2s;
++        }
++        textarea:focus {
++            border-color: var(--primary);
++            box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.25);
++        }
++
++        /* File Upload */
++        .file-dropzone {
++            border: 2px dashed var(--border-color);
++            border-radius: 12px;
++            padding: 2rem 1rem;
++            text-align: center;
++            cursor: pointer;
++            background: rgba(17, 24, 39, 0.3);
++            margin-bottom: 1rem;
++            position: relative;
++            transition: border-color 0.2s, background-color 0.2s;
++        }
++        .file-dropzone:hover {
++            border-color: var(--primary);
++            background: rgba(79, 70, 229, 0.05);
++        }
++        .file-dropzone input {
++            position: absolute;
++            inset: 0;
++            opacity: 0;
++            cursor: pointer;
++        }
++        .file-dropzone svg {
++            width: 48px;
++            height: 48px;
++            color: var(--text-secondary);
++            margin-bottom: 0.75rem;
++        }
++        .file-info {
++            font-size: 0.9rem;
++            color: var(--text-secondary);
++        }
++        .file-info strong {
++            color: var(--text-primary);
++        }
++
++        /* Buttons */
++        .btn {
++            display: inline-flex;
++            align-items: center;
++            justify-content: center;
++            width: 100%;
++            background: var(--primary);
++            color: #fff;
++            border: none;
++            padding: 0.75rem 1.5rem;
++            border-radius: 8px;
++            font-weight: 600;
++            font-size: 0.95rem;
++            cursor: pointer;
++            gap: 0.5rem;
++            transition: background-color 0.2s, opacity 0.2s;
++        }
++        .btn:hover:not(:disabled) {
++            background: var(--primary-hover);
++        }
++        .btn:disabled {
++            opacity: 0.6;
++            cursor: not-allowed;
++        }
++        .btn-outline {
++            background: none;
++            border: 1px solid var(--border-color);
++            color: var(--text-primary);
++        }
++        .btn-outline:hover:not(:disabled) {
++            background: var(--bg-card-hover);
++        }
++        .btn-danger {
++            background: var(--danger);
++        }
++        .btn-danger:hover:not(:disabled) {
++            background: #dc2626;
++        }
++        .btn-sm {
++            padding: 0.4rem 0.8rem;
++            font-size: 0.8rem;
++            border-radius: 6px;
++            width: auto;
++        }
++
++        /* Message */
++        .message-area {
++            margin-top: 1rem;
++            font-size: 0.9rem;
++            color: var(--warning);
++            text-align: center;
++            min-height: 20px;
++            word-break: break-word;
++        }
++
++        /* Workspace Placeholders */
++        .placeholder-view {
++            display: flex;
++            flex-direction: column;
++            align-items: center;
++            justify-content: center;
++            padding: 5rem 2rem;
++            text-align: center;
++            color: var(--text-secondary);
++        }
++        .placeholder-view svg {
++            width: 64px;
++            height: 64px;
++            color: var(--border-color);
++            margin-bottom: 1.5rem;
++        }
++
++        /* Stats Row */
++        .stats-row {
++            display: grid;
++            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
++            gap: 1rem;
++            margin-bottom: 1.5rem;
++        }
++        .stat-card {
++            background: rgba(17, 24, 39, 0.4);
++            border: 1px solid var(--border-color);
++            border-radius: 12px;
++            padding: 1rem;
++        }
++        .stat-card .label {
++            font-size: 0.75rem;
++            color: var(--text-secondary);
++            text-transform: uppercase;
++            letter-spacing: 0.05em;
++            margin-bottom: 0.25rem;
++        }
++        .stat-card .value {
++            font-size: 1.4rem;
++            font-weight: 700;
++        }
++
++        /* Transaction List */
++        .batch-container {
++            display: flex;
++            flex-direction: column;
++            gap: 1.5rem;
++        }
++        .batch-header {
++            display: flex;
++            justify-content: space-between;
++            align-items: center;
++            border-bottom: 1px solid var(--border-color);
++            padding-bottom: 0.75rem;
++        }
++        .batch-header h2 {
++            font-size: 1.25rem;
++            margin: 0;
++            font-weight: 700;
++        }
++
++        .table-responsive {
++            width: 100%;
++            overflow-x: auto;
++            border: 1px solid var(--border-color);
++            border-radius: 12px;
++            background: rgba(17, 24, 39, 0.2);
++        }
++        table {
++            width: 100%;
++            border-collapse: collapse;
++            text-align: left;
++            font-size: 0.9rem;
++        }
++        th {
++            background: rgba(17, 24, 39, 0.6);
++            color: var(--text-secondary);
++            font-weight: 600;
++            padding: 1rem;
++            border-bottom: 1px solid var(--border-color);
++            text-transform: uppercase;
++            font-size: 0.75rem;
++            letter-spacing: 0.05em;
++        }
++        td {
++            padding: 1rem;
++            border-bottom: 1px solid var(--border-color);
++            vertical-align: middle;
++        }
++        tr:last-child td {
++            border-bottom: none;
++        }
++        tr:hover td {
++            background: var(--bg-card-hover);
++        }
++
++        .recipient-cell {
++            display: flex;
++            flex-direction: column;
++            gap: 0.25rem;
++            max-width: 250px;
++        }
++        .recipient-cell .clean-name {
++            font-weight: 600;
++            color: var(--text-primary);
++        }
++        .recipient-cell .raw-desc {
++            font-size: 0.75rem;
++            color: var(--text-secondary);
++            white-space: nowrap;
++            overflow: hidden;
++            text-overflow: ellipsis;
++        }
++
++        /* Badges */
++        .badge {
++            display: inline-flex;
++            align-items: center;
++            padding: 0.25rem 0.5rem;
++            border-radius: 9999px;
++            font-size: 0.75rem;
++            font-weight: 600;
++            text-transform: capitalize;
++        }
++        .badge-warning {
++            background: var(--warning-light);
++            color: var(--warning);
++        }
++        .badge-success {
++            background: var(--success-light);
++            color: var(--success);
++        }
++        .badge-danger {
++            background: var(--danger-light);
++            color: var(--danger);
++        }
++        .badge-purple {
++            background: var(--purple-light);
++            color: var(--purple);
++        }
++        .badge-gray {
++            background: rgba(156, 163, 175, 0.1);
++            color: var(--text-secondary);
++        }
++
++        .amount-val {
++            font-weight: 600;
++        }
++        .amount-inflow {
++            color: var(--success);
++        }
++        .amount-outflow {
++            color: var(--text-primary);
++        }
++
++        .balance-val {
++            font-size: 0.85rem;
++        }
++        .balance-negative {
++            color: var(--danger);
++            font-weight: 500;
++        }
++
++        /* PDF Preview Specific Section */
++        .pdf-preview-box {
++            background: rgba(17, 24, 39, 0.4);
++            border: 1px solid var(--border-color);
++            border-radius: 12px;
++            padding: 1.25rem;
++            margin-bottom: 1.5rem;
++        }
++        .pdf-preview-box h3 {
++            margin: 0 0 0.75rem 0;
++            font-size: 1.1rem;
++        }
++        .raw-text-scroll {
++            background: var(--bg-main);
++            border: 1px solid var(--border-color);
++            border-radius: 8px;
++            padding: 1rem;
++            max-height: 250px;
++            overflow-y: auto;
++            font-family: monospace;
++            font-size: 0.85rem;
++            white-space: pre-wrap;
++            color: var(--text-secondary);
++        }
++
++        /* Modal Overlay */
++        #categorization-modal {
++            display: none;
++            position: fixed;
++            inset: 0;
++            background: rgba(9, 13, 22, 0.75);
++            backdrop-filter: blur(8px);
++            align-items: center;
++            justify-content: center;
++            z-index: 1000;
++        }
++        .modal-content {
++            background: var(--bg-card);
++            border: 1px solid var(--border-color);
++            border-radius: 16px;
++            max-width: 550px;
++            width: 90%;
++            max-height: 85vh;
++            overflow: hidden;
++            padding: 2.25rem;
++            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.6);
++            display: flex;
++            flex-direction: column;
++            gap: 1.5rem;
++        }
++        .modal-header h3 {
++            margin: 0;
++            font-size: 1.3rem;
++            font-weight: 700;
++            line-height: 1.4;
++        }
++        .options-list {
++            display: flex;
++            flex-direction: column;
++            gap: 0.75rem;
++            overflow-y: auto;
++            padding-right: 0.5rem;
++        }
++        /* Premium Scrollbar for options list */
++        .options-list::-webkit-scrollbar {
++            width: 6px;
++        }
++        .options-list::-webkit-scrollbar-track {
++            background: rgba(255, 255, 255, 0.03);
++            border-radius: 3px;
++        }
++        .options-list::-webkit-scrollbar-thumb {
++            background: rgba(255, 255, 255, 0.15);
++            border-radius: 3px;
++        }
++        .options-list::-webkit-scrollbar-thumb:hover {
++            background: rgba(255, 255, 255, 0.3);
++        }
++        .choice-card {
++            display: flex;
++            align-items: center;
++            gap: 1rem;
++            background: rgba(17, 24, 39, 0.4);
++            border: 1px solid var(--border-color);
++            padding: 1rem;
++            border-radius: 10px;
++            cursor: pointer;
++            transition: border-color 0.2s, background-color 0.2s;
++        }
++        .choice-card:hover {
++            border-color: var(--primary);
++            background: var(--bg-card-hover);
++        }
++        .choice-card input[type="radio"] {
++            width: 18px;
++            height: 18px;
++            accent-color: var(--primary);
++            cursor: pointer;
++        }
++        .choice-card.selected {
++            border-color: #818cf8;
++            background: rgba(79, 70, 229, 0.08);
++        }
++        .answer-trail {
++            font-size: 0.8rem;
++            color: var(--text-secondary);
++            background: rgba(17, 24, 39, 0.5);
++            padding: 0.5rem 0.75rem;
++            border-radius: 6px;
++            border: 1px solid var(--border-color);
++        }
++        .modal-footer {
++            display: flex;
++            gap: 1rem;
++            justify-content: flex-end;
++            margin-top: 0.5rem;
++        }
++        .modal-footer .btn {
++            width: auto;
++        }
++
++        /* Result View */
++        .result-view {
++            display: flex;
++            flex-direction: column;
++            gap: 1.5rem;
++        }
++        .summary-card {
++            background: rgba(16, 185, 129, 0.05);
++            border: 1px solid rgba(16, 185, 129, 0.2);
++            border-radius: 12px;
++            padding: 1.5rem;
++        }
++        .summary-title {
++            color: var(--success);
++            font-size: 1.2rem;
++            font-weight: 700;
++            margin-top: 0;
++            margin-bottom: 0.75rem;
++        }
++        .category-breakdown {
++            display: flex;
++            flex-direction: column;
++            gap: 0.75rem;
++            margin-top: 1rem;
++        }
++        .breakdown-row {
++            display: flex;
++            justify-content: space-between;
++            align-items: center;
++        }
++        .breakdown-bar-container {
++            width: 100%;
++            height: 6px;
++            background: var(--border-color);
++            border-radius: 3px;
++            margin-top: 0.25rem;
++            overflow: hidden;
++        }
++        .breakdown-bar {
++            height: 100%;
++            background: var(--primary);
++            border-radius: 3px;
++        }
++    </style>
++</head>
++<body>
++    <!-- Navbar -->
++    <nav class="navbar">
++        <div class="nav-container">
++            <a href="/upload" class="nav-logo">📊 Expense Intelligence</a>
++            <div class="nav-links">
++                <a href="/upload" class="nav-link active">Upload & Categorize</a>
++                <a href="/predict" class="nav-link">Prediction Wizard</a>
++                <a href="/pages-detailed" class="nav-link">API Registry</a>
+             </div>
+-            <div id="pdf-batch-review" style="display:none; margin-top:16px;"></div>
+         </div>
+-        <div id="result" class="result" style="display: none;"></div>
+-
+-        <div id="categorization-modal">
+-            <div class="modal-content">
+-                <h3 id="question-text"></h3>
+-                <div id="options-container"></div>
+-                <div id="answer-trail" style="font-size: 0.95em; color: #555; margin-top: 12px;"></div>
+-                <div class="button-row">
+-                    <button id="back-btn" type="button">← Back</button>
+-                    <button id="submit-answer-btn" type="button">Next</button>
++    </nav>
++
++    <div class="container">
++        <!-- Header -->
++        <header class="header">
++            <h1>M-Pesa Transaction Intelligence</h1>
++            <p>Paste SMS messages or import M-Pesa PDF statements to clean, sort, and categorize your cash outflow.</p>
++        </header>
++
++        <div class="dashboard-grid">
++            <!-- Left Panel (Inputs) -->
++            <div class="panel-card" style="height: fit-content;">
++                <div class="tab-buttons">
++                    <button id="tab-sms-btn" class="tab-btn active" onclick="switchTab('sms')">Paste SMS</button>
++                    <button id="tab-pdf-btn" class="tab-btn" onclick="switchTab('pdf')">Upload PDF Statement</button>
+                 </div>
+-            </div>
+-        </div>
+ 
+-        <script>
+-            let currentSms = '';
+-            let currentEndpoint = '/categorize-with-questions';
+-            let currentRequestMode = 'json';
+-            let nextQuestionLevel = null;
+-            let currentQuestion = null;
+-            let currentTransactionLabel = '';
+-            let currentTransactionAmount = null;
+-            let isLoading = false;
+-            let questionStack = [];
+-            let answerPath = [];
+-            let batchTransactions = [];
+-            let currentBatchIndex = -1;
+-            let inBatchMode = false;
+-
+-            document.getElementById('start-btn').addEventListener('click', startCategorization);
+-            document.getElementById('upload-pdf-btn').addEventListener('click', startPdfCategorization);
+-            document.getElementById('submit-answer-btn').addEventListener('click', submitAnswer);
+-            document.getElementById('back-btn').addEventListener('click', goBack);
+-            document.getElementById('confirm-pdf-btn').addEventListener('click', confirmPdfCandidate);
+-            document.getElementById('import-all-btn').addEventListener('click', importAllPdfTransactions);
+-            document.getElementById('finalize-batch-btn').addEventListener('click', finalizeBatchImport);
+-            document.getElementById('upload-another-btn').addEventListener('click', uploadAnother);
+-
+-            let currentPdfCandidates = [];
+-            let currentPdfCandidate = null;
+-            let currentBatchTransactions = [];
+-            let currentBatchNeedsReview = false;
+-
+-            function startCategorization() {
+-                const sms = document.getElementById('sms-text').value.trim();
+-                const pdfFile = document.getElementById('pdf-file') && document.getElementById('pdf-file').files[0];
+-                // If no SMS provided but a PDF is selected or we have PDF candidates, run PDF batch import
+-                if (!sms) {
+-                    if (pdfFile) {
+-                        // Directly import PDF so Start works immediately without Preview
+-                        importAllPdfTransactions();
+-                        return;
+-                    }
+-                    if (Array.isArray(currentPdfCandidates) && currentPdfCandidates.length > 0) {
+-                        importAllPdfTransactions();
+-                        return;
+-                    }
+-                    showMessage('Please enter an M-Pesa SMS message.');
+-                    return;
+-                }
+-                hidePdfPreview();
+-                inBatchMode = true;
+-                batchTransactions = [];
+-                currentBatchIndex = -1;
+-                currentEndpoint = '/parse-mpesa-messages';
+-                currentRequestMode = 'json';
+-                currentSms = sms;
+-                nextQuestionLevel = null;
+-                currentQuestion = null;
+-                currentTransactionLabel = '';
+-                currentTransactionAmount = null;
+-                questionStack = [];
+-                answerPath = [];
+-                document.getElementById('result').style.display = 'none';
+-                showMessage('');
+-                fetchQuestion({ mpesa_text: currentSms }, currentEndpoint, false, handleBatchParseResponse);
+-            }
++                <!-- SMS Tab -->
++                <div id="tab-sms" class="tab-content active">
++                    <textarea id="sms-text" placeholder="Paste raw M-Pesa SMS messages here (you can paste multiple messages stacked together)..." oninput="toggleSmsClear()"></textarea>
++                    <div style="margin-top: -0.5rem; margin-bottom: 1.25rem; text-align: right;">
++                        <button id="clear-sms-btn" type="button" class="btn btn-outline btn-sm" style="display:none;" onclick="clearSmsInput()">Clear SMS</button>
++                    </div>
++                    <button id="start-btn" type="button" class="btn" onclick="startCategorization()">
++                        <svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"/></svg>
++                        Categorize SMS Batch
++                    </button>
++                </div>
+ 
+-            function startPdfCategorization() {
+-                const pdfFile = document.getElementById('pdf-file').files[0];
+-                if (!pdfFile) {
+-                    showMessage('Please select a PDF file to upload.');
+-                    return;
+-                }
+-                hidePdfPreview();
+-                currentEndpoint = '/preview-pdf';
+-                currentRequestMode = 'form';
+-                nextQuestionLevel = null;
+-                currentQuestion = null;
+-                currentTransactionLabel = '';
+-                currentTransactionAmount = null;
+-                questionStack = [];
+-                answerPath = [];
+-                document.getElementById('result').style.display = 'none';
+-                showMessage('');
+-
+-                const formData = new FormData();
+-                formData.append('pdf_file', pdfFile);
+-                fetchQuestion(formData, currentEndpoint, true, handlePdfPreviewResponse);
+-            }
++                <!-- PDF Tab -->
++                <div id="tab-pdf" class="tab-content">
++                    <div class="file-dropzone">
++                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/></svg>
++                        <div class="file-info" id="file-dropzone-text">
++                            <strong>Choose PDF file</strong> or drag it here <br>
++                            <span style="font-size: 0.8rem; color: var(--text-secondary);">M-Pesa Statement PDF</span>
++                        </div>
++                        <input id="pdf-file" type="file" accept="application/pdf" onchange="handlePdfSelected()" />
++                    </div>
++
++                    <div style="display:flex; gap:10px; margin-bottom: 1.25rem; justify-content: flex-end;">
++                        <button id="clear-pdf-btn" type="button" class="btn btn-outline btn-danger btn-sm" style="display:none;" onclick="clearPdfInput()">Remove PDF</button>
++                    </div>
++
++                    <div style="display: flex; flex-direction: column; gap: 0.75rem;">
++                        <button id="upload-pdf-btn" type="button" class="btn btn-outline" onclick="startPdfCategorization()">
++                            Preview PDF Contents
++                        </button>
++                        <button id="import-all-btn" type="button" class="btn" onclick="importAllPdfTransactions()">
++                            Import PDF Statement
++                        </button>
++                    </div>
++                </div>
+ 
+-            function fetchQuestion(payload, endpoint = '/categorize-with-questions', isFormData = false, responseHandler = handleCategorizationResponse) {
+-                setLoading(true);
+-                const fetchOptions = {
+-                    method: 'POST',
+-                    body: isFormData ? payload : JSON.stringify(payload),
+-                };
+-                if (!isFormData) {
+-                    fetchOptions.headers = { 'Content-Type': 'application/json' };
+-                }
++                <div id="message" class="message-area"></div>
++            </div>
+ 
+-                fetch(endpoint, fetchOptions)
+-                .then(async response => {
+-                    const data = await response.json();
+-                    if (!response.ok) {
+-                        throw new Error(data.error || 'Server error');
+-                    }
+-                    return data;
+-                })
+-                .then(responseHandler)
+-                .catch(error => showMessage(error.message || 'Unexpected error'))
+-                .finally(() => setLoading(false));
+-            }
++            <!-- Right Panel (Workspace & Results) -->
++            <div class="panel-card" style="min-height: 480px; position: relative;">
++                <!-- Placeholder View -->
++                <div id="placeholder-view" class="placeholder-view">
++                    <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
++                    <h3>No Transactions Loaded</h3>
++                    <p>Pasted SMS messages or imported PDF tables will display here for cleaning, sorting, and categorization.</p>
++                </div>
+ 
+-            function handleCategorizationResponse(data) {
+-                if (data.needs_user_input) {
+-                    currentTransactionLabel = data.transaction && data.transaction.description ? data.transaction.description : '';
+-                    if (!data.question || !data.next_question_level) {
+-                        showMessage('Server returned incomplete question data.');
+-                        return;
+-                    }
+-                    nextQuestionLevel = data.next_question_level;
+-                    currentQuestion = data.question;
+-                    currentTransactionLabel = data.transaction && data.transaction.description ? data.transaction.description : '';
+-                    currentTransactionAmount = data.transaction && data.transaction.amount !== undefined ? Number(data.transaction.amount) : null;
+-                    answerPath = Array.isArray(data.answer_path) ? data.answer_path.slice() : answerPath;
+-                    showQuestion(data.question);
+-                    return;
+-                }
++                <!-- PDF Text Preview Box -->
++                <div id="pdf-preview-section" style="display: none; height: 100%;">
++                    <div class="pdf-preview-box">
++                        <h3>PDF Table Preview</h3>
++                        <div id="pdf-raw-text" class="raw-text-scroll"></div>
++                    </div>
++                    <div style="display: flex; gap: 1rem; align-items: center; margin-top: 1rem;">
++                        <button id="confirm-pdf-btn" type="button" class="btn" style="display:none;" onclick="confirmPdfCandidate()">Categorize Candidate Line</button>
++                        <button id="upload-another-btn" type="button" class="btn btn-outline" onclick="clearPdfInput()">Clear and Upload Another</button>
++                    </div>
++                    <div id="pdf-candidates" style="margin-top: 1.5rem;"></div>
++                </div>
+ 
+-                if (inBatchMode && currentBatchIndex >= 0) {
+-                    const currentTx = batchTransactions[currentBatchIndex];
+-                    if (currentTx) {
+-                        currentTx.category = data.final_category || currentTx.category;
+-                        currentTx.sub_type = data.sub_type || currentTx.sub_type;
+-                        currentTx.answer_path = data.answer_path || [];
+-                        currentTx.needs_review = false;
+-                        currentTx.reviewed = true;
+-                    }
+-                    currentBatchIndex = findNextReviewIndex(currentBatchIndex + 1);
+-                    if (currentBatchIndex >= 0) {
+-                        startBatchQuestion(currentBatchIndex);
+-                        return;
+-                    }
+-                    inBatchMode = false;
+-                    hideModal();
+-                    hidePdfPreview();
+-                    showResultBatch(batchTransactions);
+-                    return;
+-                }
++                <!-- Parsed Batch review Workspace -->
++                <div id="batch-workspace" style="display: none;">
++                    <div class="batch-container">
++                        <div class="batch-header">
++                            <h2 id="batch-title">Parsed Transactions</h2>
++                            <div style="display: flex; gap: 0.75rem;">
++                               <button id="start-review-btn" class="btn btn-sm" onclick="startBatchReview()">Start Review Wizard</button>
++                                <button id="finalize-batch-btn" class="btn btn-sm btn-success" onclick="finalizeBatchImport()">Finalize Import</button>
++                            </div>
++                        </div>
++
++                        <!-- Stats summary -->
++                        <div class="stats-row">
++                            <div class="stat-card">
++                                <div class="label">Total Records</div>
++                                <div id="stat-total" class="value">0</div>
++                            </div>
++                            <div class="stat-card">
++                                <div class="label">Categorized</div>
++                                <div id="stat-categorized" class="value" style="color: var(--success);">0</div>
++                            </div>
++                            <div class="stat-card">
++                                <div class="label">Needs Review</div>
++                                <div id="stat-review" class="value" style="color: var(--warning);">0</div>
++                            </div>
++                            <div class="stat-card">
++                                <div class="label">Inflow (Dropped)</div>
++                                <div id="stat-dropped" class="value" style="color: var(--text-secondary);">0</div>
++                            </div>
++                        </div>
++
++                        <!-- Table -->
++                        <div class="table-responsive">
++                            <table>
++                                <thead>
++                                    <tr>
++                                        <th style="width: 40px;">#</th>
++                                        <th style="width: 100px;">Receipt Code</th>
++                                        <th style="width: 140px;">Timestamp</th>
++                                        <th>Recipient / Description</th>
++                                        <th style="text-align: right; width: 100px;">Amount</th>
++                                        <th style="text-align: right; width: 110px;">Wallet Balance</th>
++                                        <th style="width: 150px;">Category</th>
++                                        <th style="text-align: center; width: 100px;">Action</th>
++                                    </tr>
++                                </thead>
++                                <tbody id="transactions-tbody">
++                                </tbody>
++                            </table>
++                        </div>
++                    </div>
++                </div>
+ 
+-                hideModal();
+-                hidePdfPreview();
+-                showResult(data);
+-            }
++                <!-- Final Analysis Results View -->
++                <div id="result-view" class="result-view" style="display: none;">
++                    <div class="summary-card">
++                        <h3 class="summary-title">Import Summary Successful!</h3>
++                        <div id="result-total-spending" style="font-size: 1.4rem; font-weight: 700; margin-bottom: 1.5rem;">Total Outflow: Ksh 0.00</div>
++                        
++                        <div style="font-weight: 600; font-size: 0.95rem; margin-bottom: 0.75rem; color: var(--text-secondary);">Spending by Category:</div>
++                        <div id="result-categories" class="category-breakdown">
++                        </div>
++                    </div>
++                    <button class="btn btn-outline" onclick="resetWorkspace()">Reset and Import Another</button>
++                </div>
++            </div>
++        </div>
++    </div>
+ 
+-            function handlePdfPreviewResponse(data) {
+-                if (!data.success) {
+-                    showMessage(data.error || 'PDF preview failed');
+-                    return;
+-                }
+-                showPdfPreview(data);
++    <!-- Categorization Modal Dialog -->
++    <div id="categorization-modal">
++        <div class="modal-content">
++            <div class="modal-header">
++                <h3 id="question-text">Is this transaction money going TO a person or FOR a service/product?</h3>
++            </div>
++            
++            <div id="options-container" class="options-list">
++            </div>
++            
++            <div id="answer-trail" class="answer-trail"></div>
++            
++            <div class="modal-footer">
++                <button id="back-btn" type="button" class="btn btn-outline" onclick="goBack()">← Back</button>
++                <button id="submit-answer-btn" type="button" class="btn" onclick="submitAnswer()">Next</button>
++            </div>
++        </div>
++    </div>
++
++    <script>
++        let batchTransactions = [];
++        let currentBatchIndex = -1;
++        let inBatchMode = false;
++        let isAutoAdvancing = false;
++        let chamaManualCounts = {};
++        
++        let questionStack = [];
++        let answerPath = [];
++        let currentSms = '';
++        let currentTransactionLabel = '';
++        let currentTransactionAmount = null;
++        let nextQuestionLevel = null;
++        let currentQuestion = null;
++        let currentRequestMode = 'json';
++        let currentEndpoint = '/categorize-with-questions';
++
++        // Tabs Toggle
++        function switchTab(tab) {
++            document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
++            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
++            
++            document.getElementById(`tab-${tab}-btn`).classList.add('active');
++            document.getElementById(`tab-${tab}`).classList.add('active');
++        }
++
++        // SMS input toggling
++        function toggleSmsClear() {
++            const val = document.getElementById('sms-text').value.trim();
++            document.getElementById('clear-sms-btn').style.display = val ? 'inline-block' : 'none';
++        }
++        function clearSmsInput() {
++            document.getElementById('sms-text').value = '';
++            toggleSmsClear();
++        }
++
++        // PDF file selection
++        function handlePdfSelected() {
++            const fileInput = document.getElementById('pdf-file');
++            const clearBtn = document.getElementById('clear-pdf-btn');
++            const dropzoneText = document.getElementById('file-dropzone-text');
++            
++            if (fileInput.files.length > 0) {
++                const file = fileInput.files[0];
++                dropzoneText.innerHTML = `<strong>Selected Statement:</strong><br>${file.name} (${(file.size / 1024).toFixed(1)} KB)`;
++                clearBtn.style.display = 'inline-block';
++            } else {
++                dropzoneText.innerHTML = `<strong>Choose PDF file</strong> or drag it here <br><span style="font-size: 0.8rem; color: var(--text-secondary);">M-Pesa Statement PDF</span>`;
++                clearBtn.style.display = 'none';
+             }
++        }
++        function clearPdfInput() {
++            document.getElementById('pdf-file').value = '';
++            document.getElementById('clear-pdf-btn').style.display = 'none';
++            document.getElementById('file-dropzone-text').innerHTML = `<strong>Choose PDF file</strong> or drag it here <br><span style="font-size: 0.8rem; color: var(--text-secondary);">M-Pesa Statement PDF</span>`;
++            resetWorkspace();
++        }
+ 
+-            function showPdfPreview(data) {
+-                const preview = document.getElementById('pdf-preview');
+-                const rawText = document.getElementById('pdf-raw-text');
+-                const candidateContainer = document.getElementById('pdf-candidates');
+-                const confirmButton = document.getElementById('confirm-pdf-btn');
+-                const importAllButton = document.getElementById('import-all-btn');
+-                const finalizeBatchButton = document.getElementById('finalize-batch-btn');
+-                const batchReview = document.getElementById('pdf-batch-review');
+-
+-                // STRICT TABLE-ONLY PREVIEW: show only formatted table preview.
+-                // If no table, show a rendered page image preview (OCR-capable) when available.
+-                if (data && data.has_table) {
+-                    rawText.textContent = data.table_preview || 'No table preview available.';
+-                } else if (data && data.standardized_text) {
+-                    // Show cleaned OCR text preview when available
+-                    rawText.textContent = data.standardized_text || 'No OCR text available.';
+-                } else if (data && data.has_image_preview && data.page_image_preview) {
+-                    // Insert or replace an <img> for the PNG preview
+-                    let img = document.getElementById('pdf-page-preview-img');
+-                    if (!img) {
+-                        img = document.createElement('img');
+-                        img.id = 'pdf-page-preview-img';
+-                        img.style.maxWidth = '100%';
+-                        rawText.innerHTML = '';
+-                        rawText.appendChild(img);
+-                    }
+-                    img.src = 'data:image/png;base64,' + data.page_image_preview;
+-                } else {
+-                    rawText.textContent = 'No table found in PDF (strict table-only preview).';
+-                }
+-                candidateContainer.innerHTML = '';
+-                batchReview.innerHTML = '';
+-                batchReview.style.display = 'none';
+-                finalizeBatchButton.style.display = 'none';
+-                currentBatchTransactions = [];
+-                // Candidates only from table extraction (if any)
+-                currentPdfCandidates = Array.isArray(data.candidates) ? data.candidates : [];
+-                currentPdfCandidate = null;
+-                if (!data.has_table) {
+-                    candidateContainer.innerHTML = '<p>No table found — preview is table-only.</p>';
+-                    confirmButton.style.display = 'none';
+-                    importAllButton.style.display = 'none';
+-                    document.getElementById('upload-another-btn').style.display = 'inline-block';
+-                } else if (currentPdfCandidates.length === 0) {
+-                    candidateContainer.innerHTML = '<p>Table found but no parseable M-Pesa rows were detected.</p>';
+-                    confirmButton.style.display = 'none';
+-                    importAllButton.style.display = 'inline-block';
+-                    document.getElementById('upload-another-btn').style.display = 'inline-block';
+-                } else {
+-                    currentPdfCandidates.forEach((candidate, index) => {
+-                        const wrapper = document.createElement('div');
+-                        wrapper.className = 'candidate-card';
+-                        wrapper.innerHTML = `
+-                            <label style="display:block; cursor:pointer;">
+-                                <input type="radio" name="pdf-candidate" value="${index}"> 
+-                                <strong>${candidate.parseable ? '✔️' : '❌'}</strong> ${candidate.text}
+-                            </label>
+-                        `;
+-                        candidateContainer.appendChild(wrapper);
+-                    });
+-                    confirmButton.style.display = 'inline-block';
+-                    importAllButton.style.display = 'inline-block';
+-                    document.getElementById('upload-another-btn').style.display = 'inline-block';
+-
+-                    const firstInput = candidateContainer.querySelector('input[name="pdf-candidate"]');
+-                    if (firstInput) {
+-                        firstInput.checked = true;
+-                        const parentCard = firstInput.closest('.candidate-card');
+-                        if (parentCard) {
+-                            parentCard.classList.add('selected');
+-                            parentCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
+-                        }
+-                    }
++        // Reset workspace to clean layout
++        function resetWorkspace() {
++            document.getElementById('placeholder-view').style.display = 'flex';
++            document.getElementById('pdf-preview-section').style.display = 'none';
++            document.getElementById('batch-workspace').style.display = 'none';
++            document.getElementById('result-view').style.display = 'none';
++            showMessage('');
++            batchTransactions = [];
++            currentBatchIndex = -1;
++            inBatchMode = false;
++            isAutoAdvancing = false;
++            chamaManualCounts = {};
++        }
+ 
+-                    candidateContainer.querySelectorAll('input[name="pdf-candidate"]').forEach(input => {
+-                        input.addEventListener('change', () => {
+-                            candidateContainer.querySelectorAll('.candidate-card').forEach(card => {
+-                                card.classList.remove('selected');
+-                            });
+-                            const selectedCard = input.closest('.candidate-card');
+-                            if (selectedCard) {
+-                                selectedCard.classList.add('selected');
+-                            }
+-                        });
+-                    });
+-                }
++        function showMessage(text) {
++            document.getElementById('message').textContent = text || '';
++        }
+ 
+-                preview.style.display = 'block';
+-                showMessage(data.message || 'PDF extracted. Please review the text and choose a candidate.');
+-            }
++        function setLoading(enabled) {
++            const startBtn = document.getElementById('start-btn');
++            const uploadBtn = document.getElementById('upload-pdf-btn');
++            const importBtn = document.getElementById('import-all-btn');
++            const submitBtn = document.getElementById('submit-answer-btn');
++            
++            if (startBtn) startBtn.disabled = enabled;
++            if (uploadBtn) uploadBtn.disabled = enabled;
++            if (importBtn) importBtn.disabled = enabled;
++            if (submitBtn) submitBtn.disabled = enabled;
++        }
+ 
+-            function hidePdfPreview() {
+-                const preview = document.getElementById('pdf-preview');
+-                const rawText = document.getElementById('pdf-raw-text');
+-                const candidateContainer = document.getElementById('pdf-candidates');
+-                const confirmButton = document.getElementById('confirm-pdf-btn');
+-                const importAllButton = document.getElementById('import-all-btn');
+-                const finalizeBatchButton = document.getElementById('finalize-batch-btn');
+-                const batchReview = document.getElementById('pdf-batch-review');
+-
+-                preview.style.display = 'none';
+-                rawText.textContent = '';
+-                candidateContainer.innerHTML = '';
+-                batchReview.innerHTML = '';
+-                confirmButton.style.display = 'none';
+-                importAllButton.style.display = 'none';
+-                finalizeBatchButton.style.display = 'none';
+-                currentPdfCandidates = [];
+-                currentPdfCandidate = null;
+-                currentBatchTransactions = [];
++        // API Fetch helper
++        function fetchQuestion(payload, endpoint, isFormData, responseHandler) {
++            setLoading(true);
++            const fetchOptions = {
++                method: 'POST',
++                body: isFormData ? payload : JSON.stringify(payload),
++            };
++            if (!isFormData) {
++                fetchOptions.headers = { 'Content-Type': 'application/json' };
+             }
+ 
+-            function confirmPdfCandidate() {
+-                const selected = document.querySelector('input[name="pdf-candidate"]:checked');
+-                if (!selected) {
+-                    showMessage('Please select a candidate line from the PDF preview.');
+-                    return;
+-                }
+-                const index = Number(selected.value);
+-                const candidate = currentPdfCandidates[index];
+-                if (!candidate) {
+-                    showMessage('Selected candidate is invalid.');
+-                    return;
++            fetch(endpoint, fetchOptions)
++            .then(async response => {
++                const data = await response.json();
++                if (!response.ok) {
++                    throw new Error(data.error || 'Server error');
+                 }
+-                hidePdfPreview();
+-                document.getElementById('result').style.display = 'none';
+-                currentSms = candidate.text;
+-                currentEndpoint = '/categorize-with-questions';
+-                currentRequestMode = 'json';
+-                nextQuestionLevel = null;
+-                currentQuestion = null;
+-                currentTransactionLabel = '';
+-                currentTransactionAmount = null;
+-                questionStack = [];
+-                answerPath = [];
+-                fetchQuestion({ sms_message: currentSms, answer_path: answerPath }, currentEndpoint, false);
++                return data;
++            })
++            .then(responseHandler)
++            .catch(error => showMessage(error.message || 'Unexpected error'))
++            .finally(() => setLoading(false));
++        }
++
++        // --- SMS Import Flow ---
++        function startCategorization() {
++            const sms = document.getElementById('sms-text').value.trim();
++            if (!sms) {
++                showMessage('Please paste one or more M-Pesa SMS messages first.');
++                return;
+             }
++            resetWorkspace();
++            fetchQuestion({ mpesa_text: sms }, '/parse-mpesa-messages', false, handleBatchParseResponse);
++        }
+ 
+-            function uploadAnother() {
+-                const fileInput = document.getElementById('pdf-file');
+-                if (fileInput) {
+-                    try { fileInput.value = ''; } catch (e) { /* some browsers restrict clearing file inputs, ignore */ }
+-                }
+-                hidePdfPreview();
+-                showMessage('You can upload another PDF now.');
++        function handleBatchParseResponse(data) {
++            if (!data.transactions || !Array.isArray(data.transactions)) {
++                showMessage(data.error || 'Unable to parse M-Pesa SMS messages.');
++                return;
+             }
++            
++            batchTransactions = data.transactions;
++            setupBatchWorkspace();
++        }
+ 
+-            function importAllPdfTransactions() {
+-                const pdfFile = document.getElementById('pdf-file').files[0];
+-                if (!pdfFile) {
+-                    showMessage('Please select a PDF file to upload first.');
+-                    return;
+-                }
+-                setLoading(true);
+-                const formData = new FormData();
+-                formData.append('pdf_file', pdfFile);
+-                fetch('/import-pdf-statement', {
+-                    method: 'POST',
+-                    body: formData,
+-                })
+-                .then(async response => {
+-                    const data = await response.json();
+-                    if (!response.ok) {
+-                        throw new Error(data.error || 'Batch import failed');
+-                    }
+-                    return data;
+-                })
+-                .then(handleBatchImportResponse)
+-                .catch(err => showMessage(err.message || 'Unexpected error during batch import'))
+-                .finally(() => setLoading(false));
++        // --- PDF Preview & Import Flow ---
++        function startPdfCategorization() {
++            const pdfFile = document.getElementById('pdf-file').files[0];
++            if (!pdfFile) {
++                showMessage('Please select a PDF statement file first.');
++                return;
+             }
++            resetWorkspace();
++            
++            const formData = new FormData();
++            formData.append('pdf_file', pdfFile);
++            fetchQuestion(formData, '/preview-pdf', true, handlePdfPreviewResponse);
++        }
+ 
+-            function handleBatchImportResponse(data) {
+-                if (!data.success) {
+-                    showMessage(data.error || 'Unable to import PDF statement');
+-                    return;
+-                }
+-                currentBatchTransactions = Array.isArray(data.transactions) ? data.transactions : [];
+-                currentBatchNeedsReview = currentBatchTransactions.some(tx => tx.needs_review);
+-                showBatchReview(data);
++        function handlePdfPreviewResponse(data) {
++            if (!data.success) {
++                showMessage(data.error || 'PDF text extraction failed.');
++                return;
++            }
++            
++            document.getElementById('placeholder-view').style.display = 'none';
++            document.getElementById('pdf-preview-section').style.display = 'block';
++            
++            const rawTextDiv = document.getElementById('pdf-raw-text');
++            const candidateContainer = document.getElementById('pdf-candidates');
++            const confirmBtn = document.getElementById('confirm-pdf-btn');
++
++            if (data.has_table) {
++                rawTextDiv.textContent = data.table_preview || 'No tables extracted.';
++            } else {
++                rawTextDiv.textContent = data.raw_text || 'No readable text extracted.';
+             }
+ 
+-            function showResultBatch(transactions) {
+-                const result = document.getElementById('result');
+-                const lines = ['<strong>Batch review complete:</strong>'];
+-                transactions.forEach((tx, index) => {
+-                    let status = '';
+-                    if (tx.dropped) {
+-                        status = 'Dropped — Cash inflow (not an expense)';
+-                    } else if (tx.needs_review) {
+-                        status = 'Needs review';
+-                    } else {
+-                        status = `Recorded as ${tx.category}${tx.sub_type ? ` (${tx.sub_type})` : ''}`;
+-                    }
+-                    lines.push(`<strong>Transaction ${index + 1}:</strong> ${tx.description} — Ksh ${Number(tx.amount).toLocaleString()} — ${status}`);
++            candidateContainer.innerHTML = '';
++            if (data.candidates && data.candidates.length > 0) {
++                let html = '<h3>Extracted SMS-style Candidates (Select one to classify):</h3>';
++                data.candidates.forEach((cand, idx) => {
++                    html += `
++                        <div class="choice-card" onclick="selectPdfCandidate(${idx}, this)">
++                            <input type="radio" name="pdf-candidate-radio" id="cand-${idx}" value="${idx}">
++                            <label style="cursor:pointer; width:100%; display:block;">
++                                <strong>Ksh ${Number(cand.amount).toLocaleString()}</strong> — ${cand.description}
++                            </label>
++                        </div>
++                    `;
+                 });
+-                result.innerHTML = lines.join('<br>');
+-                result.style.display = 'block';
++                candidateContainer.innerHTML = html;
++                confirmBtn.style.display = 'inline-block';
++            } else {
++                candidateContainer.innerHTML = '<p style="color: var(--text-secondary);">No SMS-style transaction lines detected inside the text blocks.</p>';
++                confirmBtn.style.display = 'none';
+             }
++            
++            showMessage('PDF preview successfully loaded.');
++        }
+ 
+-            function findNextReviewIndex(startIndex) {
+-                for (let i = startIndex; i < batchTransactions.length; i += 1) {
+-                    if (batchTransactions[i].needs_review) {
+-                        return i;
+-                    }
+-                }
+-                return -1;
++        let selectedPdfCandidateIdx = -1;
++        function selectPdfCandidate(idx, element) {
++            selectedPdfCandidateIdx = idx;
++            document.querySelectorAll('#pdf-candidates .choice-card').forEach(c => c.classList.remove('selected'));
++            element.classList.add('selected');
++            const radio = element.querySelector('input[type="radio"]');
++            if (radio) radio.checked = true;
++        }
++
++        function confirmPdfCandidate() {
++            if (selectedPdfCandidateIdx < 0) {
++                showMessage('Please select an extracted candidate transaction first.');
++                return;
++            }
++            // Trigger single SMS question wizard for the selected candidate
++            const fileInput = document.getElementById('pdf-file');
++            const formData = new FormData();
++            if (fileInput.files[0]) {
++                formData.append('pdf_file', fileInput.files[0]);
+             }
++            
++            resetWorkspace();
++            currentEndpoint = '/categorize-with-questions-file';
++            currentRequestMode = 'form';
++            questionStack = [];
++            answerPath = [];
++            
++            fetchQuestion(formData, currentEndpoint, true, handleCategorizationResponse);
++        }
+ 
+-            function startBatchQuestion(index) {
+-                const tx = batchTransactions[index];
+-                if (!tx) {
+-                    return;
+-                }
+-                currentBatchIndex = index;
+-                currentSms = tx.raw_message;
+-                currentEndpoint = '/categorize-with-questions';
+-                currentRequestMode = 'json';
+-                nextQuestionLevel = null;
+-                currentQuestion = null;
+-                currentTransactionLabel = tx.description || '';
+-                currentTransactionAmount = tx.amount !== undefined ? Number(tx.amount) : null;
+-                questionStack = [];
+-                answerPath = [];
+-                document.getElementById('result').style.display = 'none';
+-                if (tx.question) {
+-                    currentQuestion = tx.question;
+-                    nextQuestionLevel = tx.question.question_level;
+-                    showQuestion(tx.question);
+-                } else {
+-                    fetchQuestion({ sms_message: currentSms, answer_path: [] }, currentEndpoint, false);
++        function importAllPdfTransactions() {
++            const pdfFile = document.getElementById('pdf-file').files[0];
++            if (!pdfFile) {
++                showMessage('Please select a PDF statement file first.');
++                return;
++            }
++            resetWorkspace();
++            
++            const formData = new FormData();
++            formData.append('pdf_file', pdfFile);
++            setLoading(true);
++            
++            fetch('/import-pdf-statement', {
++                method: 'POST',
++                body: formData
++            })
++            .then(async response => {
++                const data = await response.json();
++                if (!response.ok) {
++                    throw new Error(data.error || 'Statement parsing failed.');
+                 }
++                return data;
++            })
++            .then(data => {
++                batchTransactions = data.transactions || [];
++                setupBatchWorkspace();
++                showMessage(data.message || 'Import successful.');
++            })
++            .catch(err => showMessage(err.message || 'Error occurred during PDF statement import.'))
++            .finally(() => setLoading(false));
++        }
++
++        // --- Workspace Rendering ---
++        function setupBatchWorkspace() {
++            document.getElementById('placeholder-view').style.display = 'none';
++            document.getElementById('pdf-preview-section').style.display = 'none';
++            document.getElementById('result-view').style.display = 'none';
++            document.getElementById('batch-workspace').style.display = 'block';
++            
++            renderTransactionsTable();
++            updateStatsSummary();
++        }
++
++        function updateStatsSummary() {
++            const total = batchTransactions.length;
++            const dropped = batchTransactions.filter(tx => tx.dropped).length;
++            const review = batchTransactions.filter(tx => tx.needs_review && !tx.dropped).length;
++            const categorized = total - dropped - review;
++            
++            document.getElementById('stat-total').textContent = total;
++            document.getElementById('stat-dropped').textContent = dropped;
++            document.getElementById('stat-review').textContent = review;
++            document.getElementById('stat-categorized').textContent = categorized;
++
++            // Update Start Review button label/display
++            const reviewBtn = document.getElementById('start-review-btn');
++            if (review === 0) {
++                reviewBtn.textContent = 'All Categorized';
++                reviewBtn.disabled = true;
++            } else {
++                reviewBtn.textContent = `Review Pending (${review})`;
++                reviewBtn.disabled = false;
+             }
++        }
+ 
+-            function showBatchParseSummary(transactions) {
+-                const result = document.getElementById('result');
+-                const lines = ['<strong>Parsed M-Pesa transactions:</strong>'];
+-                transactions.forEach((tx, index) => {
+-                    let status = '';
+-                    if (tx.dropped) {
+-                        status = 'Dropped — Cash inflow (not an expense)';
+-                    } else if (tx.needs_review) {
+-                        status = 'Needs review';
+-                    } else {
+-                        status = `Recorded as ${tx.category}${tx.sub_type ? ` (${tx.sub_type})` : ''}`;
+-                    }
+-                    lines.push(`<strong>${index + 1}.</strong> ${tx.description} — Ksh ${Number(tx.amount).toLocaleString()} — ${status}`);
+-                });
+-                result.innerHTML = lines.join('<br>');
+-                result.style.display = 'block';
++        function renderTransactionsTable() {
++            const tbody = document.getElementById('transactions-tbody');
++            tbody.innerHTML = '';
++            
++            if (batchTransactions.length === 0) {
++                tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color:var(--text-secondary);">No transactions available in this batch.</td></tr>';
++                return;
+             }
+ 
+-            function handleBatchParseResponse(data) {
+-                if (!data.transactions || !Array.isArray(data.transactions)) {
+-                    showMessage('Unable to parse M-Pesa messages.');
+-                    return;
++            batchTransactions.forEach((tx, idx) => {
++                const row = document.createElement('tr');
++                if (tx.dropped) {
++                    row.style.opacity = '0.65';
+                 }
+-                batchTransactions = data.transactions;
+-                showBatchParseSummary(batchTransactions);
+-                if (data.first_uncertain_index !== null && data.first_uncertain_index !== undefined) {
+-                    startBatchQuestion(data.first_uncertain_index);
++                
++                // Formats
++                const isCredited = (tx.category === 'inflow' || tx.dropped);
++                const amtFormatted = (isCredited ? '+' : '-') + `Ksh ${Number(tx.amount).toLocaleString(undefined, {minimumFractionDigits:2})}`;
++                const balNum = Number(tx.balance);
++                const isBalNeg = balNum < 0;
++                const balFormatted = (isBalNeg ? '-' : '') + `Ksh ${Math.abs(balNum).toLocaleString(undefined, {minimumFractionDigits:2})}`;
++                
++                let categoryBadge = '';
++                if (tx.dropped) {
++                    categoryBadge = `<span class="badge badge-gray">Inflow (Dropped)</span>`;
++                } else if (tx.needs_review) {
++                    categoryBadge = `<span class="badge badge-warning">Needs Review</span>`;
++                } else if (tx.is_propagated) {
++                    categoryBadge = `<span class="badge badge-purple">${tx.category} [Auto]</span>`;
+                 } else {
+-                    inBatchMode = false;
+-                    showMessage('All transactions were categorized automatically.');
++                    categoryBadge = `<span class="badge badge-success">${tx.category}</span>`;
+                 }
+-            }
+ 
+-            function showBatchReview(data) {
+-                const batchReview = document.getElementById('pdf-batch-review');
+-                batchReview.innerHTML = '';
+-                batchReview.style.display = 'block';
+-
+-                const title = document.createElement('h3');
+-                title.textContent = data.message || 'Review parsed transactions';
+-                batchReview.appendChild(title);
+-
+-                const list = document.createElement('div');
+-                currentBatchTransactions.forEach((tx, index) => {
+-                    const card = document.createElement('div');
+-                    card.className = 'candidate-card';
+-                    if (index === 0) {
+-                        card.classList.add('selected');
+-                    }
+-                    let status = '';
+-                    if (tx.dropped) {
+-                        status = 'Dropped — Cash inflow (not an expense)';
+-                    } else if (tx.needs_review) {
+-                        status = 'Needs review';
+-                    } else {
+-                        status = `Recorded as ${tx.category}${tx.sub_type ? ` (${tx.sub_type})` : ''}`;
+-                    }
+-                    card.innerHTML = `
+-                        <h4>Transaction ${index + 1}</h4>
+-                        <p><strong>Amount:</strong> Ksh ${tx.amount.toLocaleString()}</p>
+-                        <p><strong>Description:</strong> ${tx.description}</p>
+-                        <p><strong>Status:</strong> ${status}</p>
+-                        <p><strong>Candidate line:</strong> ${tx.candidate_text || ''}</p>
+-                    `;
+-                    list.appendChild(card);
+-                });
+-                batchReview.appendChild(list);
+-                const finalizeButton = document.getElementById('finalize-batch-btn');
+-                finalizeButton.style.display = 'inline-block';
+-                const firstCard = list.querySelector('.candidate-card');
+-                if (firstCard) {
+-                    firstCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
++                let actionHtml = '';
++                if (tx.dropped) {
++                    actionHtml = '<span style="color:var(--text-secondary); font-size:0.8rem;">Skipped</span>';
++                } else if (tx.needs_review) {
++                    actionHtml = `<button class="btn btn-sm" onclick="reviewSingleTransaction(${idx})">Review</button>`;
++                } else {
++                    actionHtml = `<span style="color:var(--success); font-weight:bold;">✓</span>`;
+                 }
+-            }
+ 
+-            function finalizeBatchImport() {
+-                if (!currentBatchTransactions.length) {
+-                    showMessage('No transactions are available to finalize.');
+-                    return;
+-                }
+-                const payload = { transactions: currentBatchTransactions };
+-                setLoading(true);
+-                fetch('/finalize-pdf-batch', {
+-                    method: 'POST',
+-                    headers: { 'Content-Type': 'application/json' },
+-                    body: JSON.stringify(payload),
+-                })
+-                .then(async response => {
+-                    const data = await response.json();
+-                    if (!response.ok) {
+-                        throw new Error(data.error || 'Unable to finalize statement import');
+-                    }
+-                    return data;
+-                })
+-                .then(result => {
+-                    hidePdfPreview();
+-                    showResult(result);
+-                    if (result.alert) {
+-                        showMessage(result.alert);
+-                    }
+-                })
+-                .catch(err => showMessage(err.message || 'Unexpected error while finalizing'))
+-                .finally(() => setLoading(false));
+-            }
++                row.innerHTML = `
++                    <td>${idx + 1}</td>
++                    <td><code style="color:#818cf8; font-weight:600;">${tx.transaction_code || '—'}</code></td>
++                    <td style="font-size:0.8rem; color:var(--text-secondary);">${tx.timestamp || '—'}</td>
++                    <td>
++                        <div class="recipient-cell">
++                            <span class="clean-name">${tx.clean_name || 'Personal Transfer'}</span>
++                            <span class="raw-desc" title="${tx.description}">${tx.description}</span>
++                        </div>
++                    </td>
++                    <td style="text-align: right;" class="amount-val ${isCredited ? 'amount-inflow' : 'amount-outflow'}">${amtFormatted}</td>
++                    <td style="text-align: right;" class="balance-val ${isBalNeg ? 'balance-negative' : ''}">${balFormatted}</td>
++                    <td>${categoryBadge}</td>
++                    <td style="text-align: center;">${actionHtml}</td>
++                `;
++                tbody.appendChild(row);
++            });
++        }
+ 
+-            function formatKsh(value) {
+-                if (value === null || value === undefined || value === '') {
+-                    return '';
++        // --- Categorization Wizard Modal Flow ---
++        function findNextReviewIndex(startIndex) {
++            for (let i = startIndex; i < batchTransactions.length; i++) {
++                if (batchTransactions[i].needs_review && !batchTransactions[i].dropped) {
++                    return i;
+                 }
+-                return `Ksh ${Number(value).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+             }
++            return -1;
++        }
+ 
+-            function showQuestion(questionData) {
+-                const amountLabel = currentTransactionAmount !== null ? ` (${formatKsh(currentTransactionAmount)})` : '';
+-                const label = currentTransactionLabel ? ` for "${currentTransactionLabel}"${amountLabel}` : amountLabel;
+-                document.getElementById('question-text').textContent = (questionData.question || 'Choose an option below:') + label;
+-                const container = document.getElementById('options-container');
+-                container.innerHTML = '';
+-
+-                (questionData.options || []).forEach(opt => {
+-                    const label = document.createElement('label');
+-                    label.innerHTML = `\n                        <input type="radio" name="answer" value="${opt.code}">\n                        ${opt.label}\n                    `;
+-                    container.appendChild(label);
+-                });
+-
+-                updateAnswerTrail();
+-                document.getElementById('categorization-modal').style.display = 'flex';
+-                setLoading(false);
++        function startBatchReview() {
++            const nextIdx = findNextReviewIndex(0);
++            if (nextIdx >= 0) {
++                isAutoAdvancing = true;
++                inBatchMode = true;
++                startReviewForIndex(nextIdx);
+             }
++        }
+ 
+-            function submitAnswer() {
+-                const selected = document.querySelector('input[name="answer"]:checked');
+-                if (!selected) {
+-                    showMessage('Please choose an answer before continuing.');
+-                    return;
+-                }
+-                if (!nextQuestionLevel) {
+-                    showMessage('Missing question state. Please restart categorization.');
+-                    return;
+-                }
+-                if (currentQuestion) {
+-                    questionStack.push({ question: currentQuestion, answer: selected.value });
+-                }
+-                answerPath.push(selected.value);
+-                showMessage('');
+-
+-                if (currentRequestMode === 'form') {
+-                    const pdfFile = document.getElementById('pdf-file').files[0];
+-                    const formData = new FormData();
+-                    if (pdfFile) {
+-                        formData.append('pdf_file', pdfFile);
+-                    }
+-                    formData.append('question_level', nextQuestionLevel);
+-                    formData.append('user_answer', selected.value);
+-                    formData.append('answer_path', JSON.stringify(answerPath));
+-                    fetchQuestion(formData, currentEndpoint, true);
+-                    return;
+-                }
++        function reviewSingleTransaction(idx) {
++            isAutoAdvancing = false;
++            inBatchMode = true;
++            startReviewForIndex(idx);
++        }
+ 
++        function startReviewForIndex(idx) {
++            currentBatchIndex = idx;
++            const tx = batchTransactions[idx];
++            
++            currentSms = tx.raw_message || tx.description;
++            currentTransactionLabel = tx.description;
++            currentTransactionAmount = Number(tx.amount);
++            
++            questionStack = [];
++            answerPath = [];
++            nextQuestionLevel = null;
++            currentQuestion = null;
++            
++            // If the transaction payload already has preloaded question metadata (from backend rules)
++            if (tx.question) {
++                currentQuestion = tx.question;
++                nextQuestionLevel = tx.question.question_level;
++                showQuestion(tx.question);
++            } else {
++                // Fetch first question node
++                currentEndpoint = '/categorize-with-questions';
++                currentRequestMode = 'json';
+                 fetchQuestion({
+                     sms_message: currentSms,
+-                    question_level: nextQuestionLevel,
+-                    user_answer: selected.value,
+-                    answer_path: answerPath,
+-                }, currentEndpoint, false);
++                    amount: tx.amount,
++                    description: tx.description,
++                    balance: tx.balance,
++                    category: tx.category,
++                    transaction_code: tx.transaction_code,
++                    answer_path: []
++                }, currentEndpoint, false, handleCategorizationResponse);
+             }
++        }
+ 
+-            function goBack() {
+-                if (questionStack.length === 0) {
+-                    hideModal();
+-                    showMessage('Question entry canceled. Edit the SMS or start again.');
+-                    return;
+-                }
++        function showQuestion(questionData) {
++            const labelNode = document.getElementById('question-text');
++            const amtStr = `Ksh ${currentTransactionAmount.toLocaleString(undefined, {minimumFractionDigits:2})}`;
++            
++            labelNode.innerHTML = `
++                <div style="font-size:0.8rem; text-transform:uppercase; color:var(--purple); font-weight:700; margin-bottom:0.25rem;">
++                    Categorizing Outflow of ${amtStr}
++                </div>
++                <div style="font-size:0.9rem; color:var(--text-secondary); margin-bottom:0.5rem; font-style:italic;">
++                    "${currentTransactionLabel}"
++                </div>
++                <div>${questionData.question}</div>
++            `;
++
++            const container = document.getElementById('options-container');
++            container.innerHTML = '';
++            
++            (questionData.options || []).forEach((opt, idx) => {
++                const card = document.createElement('div');
++                card.className = 'choice-card';
++                card.onclick = () => selectOption(opt.code, card);
++                card.innerHTML = `
++                    <input type="radio" name="answer-radio" id="opt-${opt.code}" value="${opt.code}">
++                    <span style="font-weight:500;">${opt.label}</span>
++                `;
++                container.appendChild(card);
++            });
++
++            updateAnswerTrail();
++            document.getElementById('categorization-modal').style.display = 'flex';
++            setLoading(false);
++        }
+ 
+-                const previous = questionStack.pop();
+-                answerPath.pop();
+-                currentQuestion = previous.question;
+-                nextQuestionLevel = previous.question.question_level;
+-                showQuestion(currentQuestion);
++        let selectedOptionCode = null;
++        function selectOption(code, element) {
++            selectedOptionCode = code;
++            document.querySelectorAll('#options-container .choice-card').forEach(c => c.classList.remove('selected'));
++            element.classList.add('selected');
++            const radio = element.querySelector('input[type="radio"]');
++            if (radio) radio.checked = true;
++        }
+ 
+-                const selectedInput = document.querySelector(`input[name="answer"][value="${previous.answer}"]`);
+-                if (selectedInput) {
+-                    selectedInput.checked = true;
++        function submitAnswer() {
++            if (!selectedOptionCode) {
++                showMessage('Please pick an option to proceed.');
++                return;
++            }
++            if (!nextQuestionLevel) {
++                showMessage('Question flow corrupted. Resetting...');
++                hideModal();
++                return;
++            }
++
++            if (currentQuestion) {
++                questionStack.push({ question: currentQuestion, answer: selectedOptionCode });
++            }
++            answerPath.push(selectedOptionCode);
++            const ans = selectedOptionCode;
++            selectedOptionCode = null; // Reset selection
++            
++            showMessage('');
++            const tx = batchTransactions[currentBatchIndex] || {};
++            fetchQuestion({
++                sms_message: currentSms,
++                amount: tx.amount,
++                description: tx.description,
++                balance: tx.balance,
++                category: tx.category,
++                transaction_code: tx.transaction_code,
++                question_level: nextQuestionLevel,
++                user_answer: ans,
++                answer_path: answerPath
++            }, '/categorize-with-questions', false, handleCategorizationResponse);
++        }
++
++        function goBack() {
++            if (questionStack.length === 0) {
++                hideModal();
++                showMessage('Wizard canceled.');
++                return;
++            }
++            
++            const prev = questionStack.pop();
++            answerPath.pop();
++            currentQuestion = prev.question;
++            nextQuestionLevel = prev.question.question_level;
++            
++            showQuestion(currentQuestion);
++            const savedAns = prev.answer;
++            setTimeout(() => {
++                const card = Array.from(document.querySelectorAll('#options-container .choice-card')).find(c => {
++                    const r = c.querySelector('input[type="radio"]');
++                    return r && r.value === savedAns;
++                });
++                if (card) selectOption(savedAns, card);
++            }, 50);
++        }
++
++        function updateAnswerTrail() {
++            const trail = document.getElementById('answer-trail');
++            if (answerPath.length === 0) {
++                trail.style.display = 'none';
++            } else {
++                trail.style.display = 'block';
++                trail.textContent = 'Wizard Path: ' + answerPath.join(' → ');
++            }
++        }
++
++        function hideModal() {
++            document.getElementById('categorization-modal').style.display = 'none';
++        }
++
++        function isOneTimeCategory(category, subType) {
++            const oneTimeSubTypes = [
++                'Loan repayment',
++                'Loan I\'m giving to family member',
++                'Loan I\'m giving to friend',
++                'Wedding contribution or harambee',
++                'Funeral contribution or harambee',
++                'Medical emergency harambee',
++                'One-time emergency help',
++                'School fees or education expense',
++                'Insurance or loan repayment'
++            ];
++            const oneTimeCategories = ['Personal-Loan'];
++            return oneTimeCategories.includes(category) || oneTimeSubTypes.includes(subType);
++        }
++
++        function propagateCategory(cleanName, category, subType, answerPath) {
++            if (!cleanName) return;
++            
++            if (isOneTimeCategory(category, subType)) {
++                return;
++            }
++            
++            let count = 0;
++            batchTransactions.forEach(tx => {
++                if (tx.clean_name === cleanName && tx.needs_review && !tx.dropped && !tx.is_inflow) {
++                    tx.category = category;
++                    tx.sub_type = subType;
++                    tx.answer_path = answerPath;
++                    tx.needs_review = false;
++                    tx.reviewed = true;
++                    tx.is_propagated = true; // Mark as auto-propagated
++                    count++;
+                 }
++            });
++            
++            if (count > 0) {
++                showMessage(`Auto-propagated category "${category}" to ${count} matching transaction(s) for "${cleanName}".`);
+             }
++        }
+ 
+-            function updateAnswerTrail() {
+-                const trail = document.getElementById('answer-trail');
+-                if (answerPath.length === 0) {
+-                    trail.textContent = '';
++        function handleCategorizationResponse(data) {
++            if (data.needs_user_input) {
++                if (!data.question || !data.next_question_level) {
++                    showMessage('Server returned incomplete question metadata.');
+                     return;
+                 }
+-                trail.textContent = 'Previous answers: ' + answerPath.join(' → ');
++                nextQuestionLevel = data.next_question_level;
++                currentQuestion = data.question;
++                currentTransactionLabel = data.transaction && data.transaction.description ? data.transaction.description : '';
++                currentTransactionAmount = data.transaction && data.transaction.amount !== undefined ? Number(data.transaction.amount) : null;
++                answerPath = Array.isArray(data.answer_path) ? data.answer_path.slice() : answerPath;
++                showQuestion(data.question);
++                return;
+             }
+ 
+-            function showResult(data) {
+-                const result = document.getElementById('result');
+-                const lines = [];
+-                if (data.final_category) {
+-                    lines.push(`<strong>Category:</strong> ${data.final_category}`);
+-                }
+-                if (data.sub_type) {
+-                    lines.push(`<strong>Sub-type:</strong> ${data.sub_type}`);
+-                }
+-                if (data.answer_path && data.answer_path.length) {
+-                    lines.push(`<strong>Answer path:</strong> ${data.answer_path.join(' → ')}`);
+-                }
+-                if (data.transaction) {
+-                    lines.push(`<strong>Description:</strong> ${data.transaction.description}`);
+-                    if (data.transaction.amount !== undefined) {
+-                        lines.push(`<strong>Amount:</strong> Ksh ${Number(data.transaction.amount).toLocaleString()}`);
++            // Finished categorization for the active item!
++            hideModal();
++            const finalCat = data.final_category;
++            const finalSub = data.sub_type;
++            const finalPath = data.answer_path;
++
++            // If we are in a batch workspace:
++            if (inBatchMode && currentBatchIndex >= 0) {
++                const currentTx = batchTransactions[currentBatchIndex];
++                if (currentTx) {
++                    currentTx.category = finalCat;
++                    currentTx.sub_type = finalSub;
++                    currentTx.answer_path = finalPath;
++                    currentTx.needs_review = false;
++                    currentTx.reviewed = true;
++                    
++                    let shouldPropagate = true;
++                    if (finalCat === 'Chama') {
++                        const cleanName = currentTx.clean_name;
++                        chamaManualCounts[cleanName] = (chamaManualCounts[cleanName] || 0) + 1;
++                        if (chamaManualCounts[cleanName] < 3) {
++                            shouldPropagate = false;
++                            showMessage(`Chama category applied to "${cleanName}". Review it ${3 - chamaManualCounts[cleanName]} more time(s) to trigger auto-propagation.`);
++                        }
+                     }
+-                    if (data.transaction.balance !== undefined) {
+-                        lines.push(`<strong>Balance:</strong> Ksh ${Number(data.transaction.balance).toLocaleString()}`);
++
++                    if (shouldPropagate) {
++                        // Trigger Batch Auto-Propagation across identical Clean Names!
++                        propagateCategory(currentTx.clean_name, finalCat, finalSub, finalPath);
+                     }
+                 }
+-                if (data.confidence !== undefined) {
+-                    lines.push(`<strong>Confidence:</strong> ${data.confidence}`);
+-                }
+-                if (data.summary && Array.isArray(data.summary)) {
+-                    lines.push('<strong>Batch summary:</strong>');
+-                    data.summary.forEach(item => {
+-                        lines.push(item);
+-                    });
+-                    if (data.total_spending) {
+-                        lines.push(`<strong>Total spending:</strong> ${data.total_spending}`);
++
++                // Render live changes to the workspace
++                renderTransactionsTable();
++                updateStatsSummary();
++
++                if (isAutoAdvancing) {
++                    // Check if there are further pending transactions
++                    const nextIdx = findNextReviewIndex(currentBatchIndex + 1);
++                    if (nextIdx >= 0) {
++                        startReviewForIndex(nextIdx);
++                        return;
+                     }
++                    isAutoAdvancing = false;
++                    showMessage('Batch review complete! You can now finalize the import.');
++                } else {
++                    showMessage(`Transaction categorized under "${finalCat}".`);
+                 }
+-                result.innerHTML = lines.join('<br>');
+-                result.style.display = 'block';
++                return;
+             }
+ 
+-            function hideModal() {
+-                document.getElementById('categorization-modal').style.display = 'none';
+-            }
++            // Single transaction standalone categorization response
++            showResult(data);
++        }
+ 
+-            function showMessage(text) {
+-                document.getElementById('message').textContent = text || '';
++        function showResult(data) {
++            const placeholder = document.getElementById('placeholder-view');
++            const resultPanel = document.getElementById('result-view');
++            
++            placeholder.style.display = 'none';
++            document.getElementById('pdf-preview-section').style.display = 'none';
++            document.getElementById('batch-workspace').style.display = 'none';
++            resultPanel.style.display = 'block';
++
++            document.getElementById('result-total-spending').textContent = `Total Spend: Ksh ${Number(data.transaction.amount).toLocaleString(undefined, {minimumFractionDigits:2})}`;
++            
++            const catContainer = document.getElementById('result-categories');
++            catContainer.innerHTML = `
++                <div class="breakdown-row" style="font-weight:600;">
++                    <span>${data.final_category} ${data.sub_type ? `(${data.sub_type})` : ''}</span>
++                    <span>100%</span>
++                </div>
++                <div class="breakdown-bar-container">
++                    <div class="breakdown-bar" style="width: 100%;"></div>
++                </div>
++            `;
++        }
++
++        // --- Finalize Batch Import ---
++        function finalizeBatchImport() {
++            const hasPending = batchTransactions.some(tx => tx.needs_review && !tx.dropped);
++            if (hasPending) {
++                showMessage('Please review and resolve all pending transactions before finalizing.');
++                return;
+             }
+ 
+-            function setLoading(enabled) {
+-                isLoading = enabled;
+-                document.getElementById('start-btn').disabled = enabled;
+-                document.getElementById('submit-answer-btn').disabled = enabled;
++            setLoading(true);
++            fetch('/finalize-pdf-batch', {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({ transactions: batchTransactions })
++            })
++            .then(async response => {
++                const data = await response.json();
++                if (!response.ok) {
++                    throw new Error(data.error || 'Finalization failed.');
++                }
++                return data;
++            })
++            .then(data => {
++                // Transition to final result summary card
++                document.getElementById('batch-workspace').style.display = 'none';
++                const resultPanel = document.getElementById('result-view');
++                resultPanel.style.display = 'block';
++
++                document.getElementById('result-total-spending').textContent = `Total Outflow: ${data.total_spending}`;
++                
++                const catContainer = document.getElementById('result-categories');
++                catContainer.innerHTML = '';
++
++                if (Array.isArray(data.summary)) {
++                    // Calculate total numeric spending to draw ratios
++                    let totalVal = 0;
++                    const parsedCategories = data.summary.map(str => {
++                        const parts = str.split(': Ksh ');
++                        const catName = parts[0];
++                        const catVal = parseFloat(parts[1].replace(/,/g, ''));
++                        totalVal += catVal;
++                        return { name: catName, value: catVal, original: str };
++                    });
++
++                    parsedCategories.forEach(cat => {
++                        const pct = totalVal > 0 ? ((cat.value / totalVal) * 100).toFixed(0) : 0;
++                        const row = document.createElement('div');
++                        row.style.marginBottom = '1rem';
++                        row.innerHTML = `
++                            <div class="breakdown-row" style="font-size:0.9rem;">
++                                <span style="font-weight:600;">${cat.name}</span>
++                                <span style="color:var(--text-secondary);">Ksh ${cat.value.toLocaleString(undefined, {minimumFractionDigits:0})} (${pct}%)</span>
++                            </div>
++                            <div class="breakdown-bar-container">
++                                <div class="breakdown-bar" style="width: ${pct}%;"></div>
++                            </div>
++                        `;
++                        catContainer.appendChild(row);
++                    });
++                }
++                
++                showMessage(data.message || 'Batch import finalized.');
++            })
++            .catch(err => showMessage(err.message || 'Error finalize.'))
++            .finally(() => setLoading(false));
++        }
++
++        window.addEventListener('DOMContentLoaded', () => {
++            const urlParams = new URLSearchParams(window.location.search);
++            const fileParam = urlParams.get('file');
++            if (fileParam) {
++                resetWorkspace();
++                setLoading(true);
++                showMessage('Auto-loading statement file...');
++                fetch('/import-pdf-statement', {
++                    method: 'POST',
++                    headers: { 'Content-Type': 'application/json' },
++                    body: JSON.stringify({ filename: fileParam })
++                })
++                .then(async response => {
++                    const data = await response.json();
++                    if (!response.ok) {
++                        throw new Error(data.error || 'Auto-load failed.');
++                    }
++                    return data;
++                })
++                .then(data => {
++                    batchTransactions = data.transactions || [];
++                    setupBatchWorkspace();
++                    showMessage(data.message || 'Auto-loaded statement successfully.');
++                })
++                .catch(err => showMessage(err.message || 'Error auto-loading statement.'))
++                .finally(() => setLoading(false));
+             }
+-        </script>
+-    </body>
+-    </html>
+-    """
++        });
++    </script>
++</body>
++</html>
++"""
+ 
+ 
+ @app.route('/predict')
+@@ -1326,7 +2190,22 @@ def categorize_with_questions():
+     sms_message = sms_message.strip()
+     transaction = parse_mpesa_sms(sms_message)
+     if transaction is None:
+-        return _api_error('Unable to parse M-Pesa SMS', 400)
++        try:
++            amount = float(request_data.get('amount') or 0.0)
++            balance = float(request_data.get('balance') or 0.0)
++            description = request_data.get('description') or sms_message
++            category = request_data.get('category') or 'expense'
++            code = request_data.get('transaction_code')
++            transaction = Transaction(
++                amount=amount,
++                description=description,
++                category=category,
++                balance=balance,
++                timestamp=datetime.now(),
++                transaction_code=code
++            )
++        except Exception as e:
++            return _api_error(f'Unable to parse M-Pesa SMS or reconstruct transaction: {str(e)}', 400)
+ 
+     transaction_payload = _build_transaction_payload(transaction)
+ 
+@@ -1420,41 +2299,51 @@ def parse_mpesa_messages_endpoint():
+ 
+     raw_messages = split_mpesa_messages(mpesa_text)
+     transactions = []
+-    first_uncertain_index = None
+-    for index, raw in enumerate(raw_messages):
++    for raw in raw_messages:
+         transaction = parse_mpesa_sms(raw)
+-        if transaction is None:
+-            continue
++        if transaction is not None:
++            transactions.append(transaction)
++
++    # Sort, deduplicate, and calculate negative running balance
++    transactions = process_and_deduplicate_transactions(transactions)
++
++    items = []
++    first_uncertain_index = None
++    for transaction in transactions:
+         category, sub_type, needs_input, question = categorize_transaction_flow(transaction)
+         # If parser detected an incoming/credit, mark as dropped (cash inflow) and skip questions
+-        dropped = (transaction.category == 'inflow')
++        dropped = (transaction.category == 'inflow' or getattr(transaction, 'is_inflow', False))
+         if dropped:
+             needs_input = False
+-            if first_uncertain_index is None:
+-                # treat as not uncertain but still record position
+-                pass
++            
+         if needs_input and first_uncertain_index is None:
+-            first_uncertain_index = len(transactions)
+-        transactions.append({
++            first_uncertain_index = len(items)
++
++        ts_str = transaction.timestamp.strftime('%Y-%m-%d %H:%M:%S') if transaction.timestamp else ''
++        
++        items.append({
+             'transaction_code': transaction.transaction_code,
+             'description': transaction.description,
+             'amount': transaction.amount,
+             'balance': transaction.balance,
+-            'raw_message': raw,
++            'timestamp': ts_str,
++            'clean_name': getattr(transaction, 'clean_name', ''),
++            'raw_message': getattr(transaction, 'candidate_text', transaction.description),
+             'category': None if dropped else (category if not needs_input else None),
+             'sub_type': None if dropped else (sub_type if not needs_input else None),
+             'needs_review': needs_input,
+             'question': question if needs_input else None,
+             'dropped': bool(dropped),
+             'dropped_reason': 'Cash inflow (not an expense)' if dropped else None,
++            'is_inflow': getattr(transaction, 'is_inflow', False),
+         })
+ 
+-    if not transactions:
++    if not items:
+         return _api_error('No valid M-Pesa messages found.', 400)
+ 
+     return _api_success(
+         data={
+-            'transactions': transactions,
++            'transactions': items,
+             'first_uncertain_index': first_uncertain_index,
+         },
+         message='Parsed M-Pesa transactions successfully',
+@@ -1463,11 +2352,28 @@ def parse_mpesa_messages_endpoint():
+ 
+ @app.route('/import-pdf-statement', methods=['POST'])
+ def import_pdf_statement():
+-    pdf_file = request.files.get('pdf_file')
+-    if pdf_file is None:
++    filename = None
++    pdf_file = None
++    if request.is_json:
++        data = request.get_json(silent=True) or {}
++        filename = data.get('filename')
++    else:
++        pdf_file = request.files.get('pdf_file')
++        filename = request.form.get('filename')
++
++    if not pdf_file and filename:
++        import os
++        safe_name = os.path.basename(filename)
++        try:
++            with open(safe_name, 'rb') as f:
++                pdf_bytes = f.read()
++        except Exception as e:
++            return _api_error(f'Failed to read local PDF file: {str(e)}', 400)
++    elif pdf_file:
++        pdf_bytes = pdf_file.read()
++    else:
+         return _api_error('pdf_file is required', 400)
+ 
+-    pdf_bytes = pdf_file.read()
+     if not pdf_bytes:
+         return _api_error('Uploaded PDF is empty', 400)
+ 
+@@ -1475,17 +2381,33 @@ def import_pdf_statement():
+     if not transactions:
+         return _api_error('No valid M-Pesa transactions were found in the PDF', 400)
+ 
++    # Sort, deduplicate, and calculate negative running balance
++    transactions = process_and_deduplicate_transactions(transactions)
++
+     items = []
+     for transaction in transactions:
+         category, sub_type, needs_input, question = categorize_transaction_flow(transaction)
++        dropped = (transaction.category == 'inflow' or getattr(transaction, 'is_inflow', False))
++        if dropped:
++            needs_input = False
++
++        ts_str = transaction.timestamp.strftime('%Y-%m-%d %H:%M:%S') if transaction.timestamp else ''
++
+         items.append({
++            'transaction_code': transaction.transaction_code,
+             'description': transaction.description,
+             'amount': transaction.amount,
+             'balance': transaction.balance,
++            'timestamp': ts_str,
++            'clean_name': getattr(transaction, 'clean_name', ''),
+             'candidate_text': getattr(transaction, 'candidate_text', None),
+-            'category': category if not needs_input else None,
+-            'needs_review': bool(needs_input),
+-            'sub_type': sub_type,
++            'category': None if dropped else (category if not needs_input else None),
++            'sub_type': None if dropped else (sub_type if not needs_input else None),
++            'needs_review': not dropped and bool(needs_input),
++            'question': question if (needs_input and not dropped) else None,
++            'dropped': bool(dropped),
++            'dropped_reason': 'Cash inflow (not an expense)' if dropped else None,
++            'is_inflow': getattr(transaction, 'is_inflow', False),
+         })
+ 
+     return _api_success(
+@@ -1504,9 +2426,26 @@ def finalize_pdf_batch():
+     if not isinstance(transactions, list) or not transactions:
+         return _api_error('No batch transactions provided', 400)
+ 
++    # Chronologically sort incoming transactions in finalize
++    transactions = sorted(transactions, key=lambda x: x.get('timestamp') or '')
++
++    # Deduplicate in finalize to be doubly safe
++    seen = set()
++    deduped = []
++    for tx in transactions:
++        tx_code = tx.get('transaction_code') or ''
++        amt = float(tx.get('amount') or 0)
++        ts_str = tx.get('timestamp') or ''
++        key = (tx_code, amt, ts_str)
++        if key not in seen:
++            seen.add(key)
++            deduped.append(tx)
++
+     spending_by_category = {}
+     total_spending = 0.0
+-    for tx in transactions:
++    for tx in deduped:
++        if tx.get('dropped'):
++            continue
+         try:
+             amount = float(tx.get('amount', 0) or 0)
+         except Exception:
+@@ -1521,7 +2460,7 @@ def finalize_pdf_batch():
+             'summary': summary_lines,
+             'total_spending': f"Ksh {total_spending:,.0f}",
+         },
+-        message='Batch statement import completed. Review the category breakdown below.',
++        message='Batch import completed. Review the category breakdown below.',
+     )
+ 
+ 

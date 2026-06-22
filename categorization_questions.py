@@ -53,6 +53,7 @@ QUESTION_NODES = {
             {'code': 'B7', 'label': 'Business expense (if for work or business purposes)'},
             {'code': 'B8', 'label': 'Healthcare (clinic, hospital, pharmacy, medical service)'},
             {'code': 'B9', 'label': 'Other service or product'},
+            {'code': 'B10', 'label': 'Inventories and Supplies (soaps, deodorants, books, phone, furniture, assets)'},
         ],
     ),
     '3': CategorizationQuestion(
@@ -174,6 +175,7 @@ FINAL_CATEGORY_MAP = {
     'B7': {'category': 'Business', 'sub_type': 'Business expense', 'code': 'B7'},
     'B8': {'category': 'Informal Tax', 'sub_type': 'Healthcare or medical expense', 'code': 'B8'},
     'B9': {'category': 'Other', 'sub_type': 'Other service or product', 'code': 'B9'},
+    'B10': {'category': 'Inventories and Supplies', 'sub_type': 'Inventories and Supplies', 'code': 'B10'},
     'C2': {'category': 'Other', 'sub_type': 'Staying in M-Pesa', 'code': 'C2'},
 }
 
@@ -201,7 +203,9 @@ def _wrap_result(final_data):
     }
 
 
-def get_disambiguation_questions(transaction):
+def get_disambiguation_questions(transaction, node_code='1'):
+    if node_code in QUESTION_NODES:
+        return QUESTION_NODES[node_code].to_dict()
     return QUESTION_NODES['1'].to_dict()
 
 
