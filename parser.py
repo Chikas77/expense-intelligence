@@ -583,6 +583,9 @@ def extract_mpesa_pdf_candidates(pdf_bytes):
             'parseable': True,
             'description': tx.description,
             'amount': tx.amount,
+            'balance': tx.balance,
+            'category': tx.category,
+            'transaction_code': tx.transaction_code,
         })
 
     table_preview = ''

@@ -14,6 +14,8 @@ from parser import (
 from categorization_questions import process_answer
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
+
 
 
 def _build_transaction_payload(transaction):
@@ -105,6 +107,11 @@ def _api_error(message, status_code=400, details=None, **extra):
         payload['details'] = details
     payload.update(extra)
     return jsonify(payload), status_code
+
+
+@app.errorhandler(413)
+def request_entity_too_large(error):
+    return _api_error('File size exceeds the 10MB upload limit', 413)
 
 
 def _compute_next_question_level(question):
@@ -1068,6 +1075,8 @@ def upload():
         let inBatchMode = false;
         let isAutoAdvancing = false;
         let chamaManualCounts = {};
+        let pdfCandidates = [];
+        let currentTransaction = null;
         
         let questionStack = [];
         let answerPath = [];
@@ -1106,6 +1115,15 @@ def upload():
             
             if (fileInput.files.length > 0) {
                 const file = fileInput.files[0];
+                const maxSize = 10 * 1024 * 1024; // 10MB
+                if (file.size > maxSize) {
+                    showMessage('File size exceeds the 10MB limit. Please choose a smaller PDF.');
+                    fileInput.value = '';
+                    dropzoneText.innerHTML = `<strong>Choose PDF file</strong> or drag it here <br><span style="font-size: 0.8rem; color: var(--text-secondary);">M-Pesa Statement PDF</span>`;
+                    clearBtn.style.display = 'none';
+                    return;
+                }
+                showMessage('');
                 dropzoneText.innerHTML = `<strong>Selected Statement:</strong><br>${file.name} (${(file.size / 1024).toFixed(1)} KB)`;
                 clearBtn.style.display = 'inline-block';
             } else {
@@ -1132,6 +1150,9 @@ def upload():
             inBatchMode = false;
             isAutoAdvancing = false;
             chamaManualCounts = {};
+            pdfCandidates = [];
+            currentTransaction = null;
+            selectedPdfCandidateIdx = -1;
         }
 
         function showMessage(text) {
@@ -1215,6 +1236,7 @@ def upload():
                 return;
             }
             
+            pdfCandidates = data.candidates || [];
             document.getElementById('placeholder-view').style.display = 'none';
             document.getElementById('pdf-preview-section').style.display = 'block';
             
@@ -1265,20 +1287,46 @@ def upload():
                 showMessage('Please select an extracted candidate transaction first.');
                 return;
             }
-            // Trigger single SMS question wizard for the selected candidate
-            const fileInput = document.getElementById('pdf-file');
-            const formData = new FormData();
-            if (fileInput.files[0]) {
-                formData.append('pdf_file', fileInput.files[0]);
+            
+            const candidate = pdfCandidates[selectedPdfCandidateIdx];
+            if (!candidate) {
+                showMessage('Selected candidate not found.');
+                return;
             }
             
-            resetWorkspace();
-            currentEndpoint = '/categorize-with-questions-file';
-            currentRequestMode = 'form';
+            // Set wizard state for single mode
+            inBatchMode = false;
+            currentSms = candidate.text || candidate.description;
+            currentTransactionLabel = candidate.description;
+            currentTransactionAmount = Number(candidate.amount);
+            currentTransaction = {
+                amount: candidate.amount,
+                description: candidate.description,
+                balance: candidate.balance || 0,
+                category: candidate.category || 'expense',
+                transaction_code: candidate.transaction_code || ''
+            };
+            
             questionStack = [];
             answerPath = [];
+            nextQuestionLevel = null;
+            currentQuestion = null;
             
-            fetchQuestion(formData, currentEndpoint, true, handleCategorizationResponse);
+            currentEndpoint = '/categorize-with-questions';
+            currentRequestMode = 'json';
+            
+            showMessage('');
+            
+            // Fetch first question node
+            fetchQuestion({
+                sms_message: currentSms,
+                amount: currentTransaction.amount,
+                description: currentTransaction.description,
+                balance: currentTransaction.balance,
+                category: currentTransaction.category,
+                transaction_code: currentTransaction.transaction_code,
+                answer_path: []
+            }, currentEndpoint, false, handleCategorizationResponse);
         }
 
         function importAllPdfTransactions() {
@@ -1527,7 +1575,7 @@ def upload():
             selectedOptionCode = null; // Reset selection
             
             showMessage('');
-            const tx = batchTransactions[currentBatchIndex] || {};
+            const tx = inBatchMode ? (batchTransactions[currentBatchIndex] || {}) : (currentTransaction || {});
             fetchQuestion({
                 sms_message: currentSms,
                 amount: tx.amount,
@@ -1629,6 +1677,10 @@ def upload():
                 currentQuestion = data.question;
                 currentTransactionLabel = data.transaction && data.transaction.description ? data.transaction.description : '';
                 currentTransactionAmount = data.transaction && data.transaction.amount !== undefined ? Number(data.transaction.amount) : null;
+                if (!inBatchMode && data.transaction) {
+                    currentTransaction = data.transaction;
+                    currentSms = data.transaction.raw_message || data.transaction.description || currentSms;
+                }
                 answerPath = Array.isArray(data.answer_path) ? data.answer_path.slice() : answerPath;
                 showQuestion(data.question);
                 return;

@@ -86,6 +86,18 @@ class ReconstructionAndBalancesTest(unittest.TestCase):
         self.assertTrue(json_data['success'])
         self.assertGreater(len(json_data['data']['transactions']), 0)
 
+    def test_preview_pdf_candidates_fields(self):
+        from parser import extract_mpesa_pdf_candidates
+        with open("temp_statement_3888.pdf", "rb") as f:
+            pdf_bytes = f.read()
+        res = extract_mpesa_pdf_candidates(pdf_bytes)
+        self.assertIn('parseable', res)
+        self.assertGreater(len(res['parseable']), 0)
+        first_candidate = res['parseable'][0]
+        self.assertIn('balance', first_candidate)
+        self.assertIn('category', first_candidate)
+        self.assertIn('transaction_code', first_candidate)
+
     def test_overdraft_cascading_balance_and_sorting(self):
         # 1. Inflow of 1000.0, followed by repayment of 400.0 (simultaneous)
         tx_repayment = Transaction(amount=400.0, description="OD Loan Repayment to 3201003", category="expense", balance=600.0, timestamp=datetime(2026, 6, 1, 10, 0, 0), transaction_code="TX_REP")

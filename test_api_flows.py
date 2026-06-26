@@ -35,6 +35,15 @@ class ApiFlowTest(unittest.TestCase):
         self.assertIn(b'Confirm Transaction Categories', response.data)
         self.assertIn(b'transaction_0_amount', response.data)
 
+    def test_upload_file_size_exceeds_limit(self):
+        large_bytes = b'0' * (11 * 1024 * 1024)
+        data = {'pdf_file': (io.BytesIO(large_bytes), 'large_statement.pdf')}
+        response = self.client.post('/preview-pdf', data=data, content_type='multipart/form-data')
+        self.assertEqual(response.status_code, 413)
+        json_data = response.get_json()
+        self.assertFalse(json_data['success'])
+        self.assertIn('File size exceeds the 10MB upload limit', json_data['error'])
+
     @patch('app.extract_mpesa_pdf_candidates')
     def test_preview_pdf_endpoint_returns_candidates(self, mock_extract):
         mock_extract.return_value = {
