@@ -235,15 +235,23 @@ def parse_mpesa_messages(mpesa_text: str):
     return split_and_parse_mpesa_messages(mpesa_text)
 
 
-def _extract_text_from_pdf_bytes(pdf_bytes):
+def _extract_text_from_pdf_bytes(pdf_bytes, password=None):
     text_pages = []
     try:
         reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+        if reader.is_encrypted:
+            if not password:
+                raise ValueError("password_required")
+            decrypt_res = reader.decrypt(password)
+            if not decrypt_res:
+                raise ValueError("invalid_password")
         for page in reader.pages:
             page_text = page.extract_text() or ''
             if page_text.strip():
                 text_pages.append(page_text)
-    except Exception:
+    except Exception as e:
+        if str(e) in ("password_required", "invalid_password"):
+            raise
         pass
     return '\n'.join(text_pages).strip()
 
@@ -355,10 +363,10 @@ def _format_table_preview_from_table(table, max_rows=10):
     return '\n'.join(lines)
 
 
-def extract_text_from_pdf_bytes(pdf_bytes):
+def extract_text_from_pdf_bytes(pdf_bytes, password=None):
     if not isinstance(pdf_bytes, (bytes, bytearray)):
         return ''
-    return _extract_text_from_pdf_bytes(pdf_bytes)
+    return _extract_text_from_pdf_bytes(pdf_bytes, password=password)
 
 
 def _categorize_from_description(description: str, is_inflow: bool) -> str:
@@ -389,16 +397,29 @@ def _categorize_from_description(description: str, is_inflow: bool) -> str:
     return 'other'
 
 
-def extract_mpesa_statement_pdf(pdf_bytes):
+def extract_mpesa_statement_pdf(pdf_bytes, password=None):
     """Extract transactions from a structured M-PESA statement PDF using Camelot."""
     if not isinstance(pdf_bytes, (bytes, bytearray)):
         return []
+
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+        if reader.is_encrypted:
+            if not password:
+                raise ValueError("password_required")
+            decrypt_res = reader.decrypt(password)
+            if not decrypt_res:
+                raise ValueError("invalid_password")
+    except Exception as e:
+        if str(e) in ("password_required", "invalid_password"):
+            raise
+        pass
 
     temp_filename = os.path.abspath(f"temp_statement_{os.getpid()}_{uuid.uuid4().hex}_extract.pdf").replace('\\', '/')
     try:
         with open(temp_filename, "wb") as f:
             f.write(pdf_bytes)
-        tables = camelot.read_pdf(temp_filename, pages='all', flavor='stream')
+        tables = camelot.read_pdf(temp_filename, pages='all', flavor='stream', password=password)
     except Exception as e:
         print(f"Camelot extraction failed: {e}")
         return []
@@ -563,7 +584,7 @@ def extract_mpesa_statement_pdf(pdf_bytes):
     return filtered_transactions
 
 
-def extract_mpesa_pdf_candidates(pdf_bytes):
+def extract_mpesa_pdf_candidates(pdf_bytes, password=None):
     if not isinstance(pdf_bytes, (bytes, bytearray)):
         return {
             'raw_text': '',
@@ -571,8 +592,8 @@ def extract_mpesa_pdf_candidates(pdf_bytes):
             'parseable': [],
         }
 
-    raw_text = _extract_text_from_pdf_bytes(pdf_bytes)
-    transactions = extract_mpesa_statement_pdf(pdf_bytes)
+    raw_text = _extract_text_from_pdf_bytes(pdf_bytes, password=password)
+    transactions = extract_mpesa_statement_pdf(pdf_bytes, password=password)
 
     candidates = []
     parseable = []
@@ -597,7 +618,7 @@ def extract_mpesa_pdf_candidates(pdf_bytes):
         # Scan page by page (up to page 3) for the preview to avoid parsing the whole document twice
         for pg in ['1', '2', '3']:
             try:
-                tables = camelot.read_pdf(temp_filename, pages=pg, flavor='stream')
+                tables = camelot.read_pdf(temp_filename, pages=pg, flavor='stream', password=password)
                 if tables:
                     transaction_table = None
                     for table in tables:
@@ -634,16 +655,16 @@ def extract_mpesa_pdf_candidates(pdf_bytes):
     }
 
 
-def parse_mpesa_pdf_all(pdf_bytes):
+def parse_mpesa_pdf_all(pdf_bytes, password=None):
     if not isinstance(pdf_bytes, (bytes, bytearray)):
         return []
 
-    transactions = extract_mpesa_statement_pdf(pdf_bytes)
+    transactions = extract_mpesa_statement_pdf(pdf_bytes, password=password)
     if transactions:
         return transactions
 
     try:
-        text = _extract_text_from_pdf_bytes(pdf_bytes)
+        text = _extract_text_from_pdf_bytes(pdf_bytes, password=password)
     except Exception:
         return []
 
@@ -662,16 +683,16 @@ def parse_mpesa_pdf_all(pdf_bytes):
     return transactions
 
 
-def parse_mpesa_pdf(pdf_bytes):
+def parse_mpesa_pdf(pdf_bytes, password=None):
     if not isinstance(pdf_bytes, (bytes, bytearray)):
         return None
 
-    transactions = extract_mpesa_statement_pdf(pdf_bytes)
+    transactions = extract_mpesa_statement_pdf(pdf_bytes, password=password)
     if transactions:
         return transactions[0]
 
     try:
-        text = _extract_text_from_pdf_bytes(pdf_bytes)
+        text = _extract_text_from_pdf_bytes(pdf_bytes, password=password)
     except Exception:
         return None
 

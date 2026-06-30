@@ -1069,6 +1069,26 @@ def upload():
         </div>
     </div>
 
+    <!-- Password Modal Dialog -->
+    <div id="password-modal" style="display: none; position: fixed; inset: 0; background: rgba(9, 13, 22, 0.75); backdrop-filter: blur(8px); align-items: center; justify-content: center; z-index: 1000;">
+        <div class="modal-content" style="max-width: 450px;">
+            <div class="modal-header">
+                <h3>Password Protected Statement</h3>
+                <p style="font-size: 0.9rem; color: var(--text-secondary); margin-top: 0.5rem;">This M-Pesa statement PDF is encrypted. Please enter the decryption password to proceed.</p>
+            </div>
+            
+            <div style="display: flex; flex-direction: column; gap: 0.5rem;">
+                <input type="password" id="pdf-password-input" placeholder="Enter PDF password" style="width: 100%; padding: 0.75rem; background: var(--bg-main); border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-primary); outline: none; font-family: inherit; font-size: 0.95rem;" onkeydown="if(event.key === 'Enter') submitPdfPassword()">
+                <div id="password-error-message" style="font-size: 0.85rem; color: var(--danger); min-height: 20px; margin-top: 0.25rem;"></div>
+            </div>
+            
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline" onclick="cancelPdfPassword()">Cancel</button>
+                <button type="button" class="btn" onclick="submitPdfPassword()">Decrypt</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         let batchTransactions = [];
         let currentBatchIndex = -1;
@@ -1077,6 +1097,7 @@ def upload():
         let chamaManualCounts = {};
         let pdfCandidates = [];
         let currentTransaction = null;
+        let lastRequest = null;
         
         let questionStack = [];
         let answerPath = [];
@@ -1173,6 +1194,7 @@ def upload():
 
         // API Fetch helper
         function fetchQuestion(payload, endpoint, isFormData, responseHandler) {
+            lastRequest = { payload, endpoint, isFormData, responseHandler };
             setLoading(true);
             const fetchOptions = {
                 method: 'POST',
@@ -1186,13 +1208,79 @@ def upload():
             .then(async response => {
                 const data = await response.json();
                 if (!response.ok) {
-                    throw new Error(data.error || 'Server error');
+                    throw { status: response.status, message: data.error || 'Server error' };
                 }
                 return data;
             })
             .then(responseHandler)
-            .catch(error => showMessage(error.message || 'Unexpected error'))
+            .catch(error => {
+                if (error.status === 401) {
+                    showPasswordModal(error.message);
+                } else {
+                    showMessage(error.message || 'Unexpected error');
+                }
+            })
             .finally(() => setLoading(false));
+        }
+
+        function showPasswordModal(errorMsg) {
+            const modal = document.getElementById('password-modal');
+            const input = document.getElementById('pdf-password-input');
+            const errDiv = document.getElementById('password-error-message');
+            
+            errDiv.textContent = '';
+            if (errorMsg === 'invalid_password') {
+                errDiv.textContent = 'Invalid password. Please try again.';
+            } else if (errorMsg === 'password_required') {
+                errDiv.textContent = '';
+            }
+            
+            input.value = '';
+            modal.style.display = 'flex';
+            input.focus();
+        }
+
+        function hidePasswordModal() {
+            document.getElementById('password-modal').style.display = 'none';
+        }
+
+        function cancelPdfPassword() {
+            hidePasswordModal();
+            resetWorkspace();
+            showMessage('Decryption cancelled.');
+        }
+
+        function submitPdfPassword() {
+            const input = document.getElementById('pdf-password-input');
+            const password = input.value.trim();
+            if (!password) {
+                document.getElementById('password-error-message').textContent = 'Password cannot be empty.';
+                return;
+            }
+
+            if (!lastRequest) {
+                hidePasswordModal();
+                return;
+            }
+
+            hidePasswordModal();
+            
+            // Add password to payload
+            if (lastRequest.isFormData) {
+                lastRequest.payload.set('password', password);
+            } else {
+                if (typeof lastRequest.payload === 'object' && lastRequest.payload !== null) {
+                    lastRequest.payload.password = password;
+                }
+            }
+
+            // Retry request
+            fetchQuestion(
+                lastRequest.payload,
+                lastRequest.endpoint,
+                lastRequest.isFormData,
+                lastRequest.responseHandler
+            );
         }
 
         // --- SMS Import Flow ---
@@ -2342,6 +2430,7 @@ def categorize_with_questions():
 @app.route('/preview-pdf', methods=['POST'])
 def preview_pdf():
     pdf_file = request.files.get('pdf_file')
+    password = request.form.get('password')
     if pdf_file is None:
         return _api_error('pdf_file is required', 400)
 
@@ -2350,7 +2439,12 @@ def preview_pdf():
         return _api_error('Uploaded PDF is empty', 400)
 
     try:
-        preview = extract_mpesa_pdf_candidates(pdf_bytes)
+        preview = extract_mpesa_pdf_candidates(pdf_bytes, password=password)
+    except ValueError as val_err:
+        err_str = str(val_err)
+        if err_str in ("password_required", "invalid_password"):
+            return _api_error(err_str, 401)
+        return _api_error(err_str, 400)
     except RuntimeError as exc:
         return _api_error(str(exc), 500)
 
@@ -2433,12 +2527,15 @@ def parse_mpesa_messages_endpoint():
 def import_pdf_statement():
     filename = None
     pdf_file = None
+    password = None
     if request.is_json:
         data = request.get_json(silent=True) or {}
         filename = data.get('filename')
+        password = data.get('password')
     else:
         pdf_file = request.files.get('pdf_file')
         filename = request.form.get('filename')
+        password = request.form.get('password')
 
     if not pdf_file and filename:
         import os
@@ -2456,7 +2553,14 @@ def import_pdf_statement():
     if not pdf_bytes:
         return _api_error('Uploaded PDF is empty', 400)
 
-    transactions = parse_mpesa_pdf_all(pdf_bytes)
+    try:
+        transactions = parse_mpesa_pdf_all(pdf_bytes, password=password)
+    except ValueError as val_err:
+        err_str = str(val_err)
+        if err_str in ("password_required", "invalid_password"):
+            return _api_error(err_str, 401)
+        return _api_error(err_str, 400)
+
     if not transactions:
         return _api_error('No valid M-Pesa transactions were found in the PDF', 400)
 

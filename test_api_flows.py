@@ -166,6 +166,60 @@ class ApiFlowTest(unittest.TestCase):
         self.assertEqual(json_data['transactions'][2]['amount'], 140.0)
         self.assertIn('JOSEPH', json_data['transactions'][2]['description'])
 
+    @patch('parser.pypdf.PdfReader')
+    def test_preview_pdf_password_required(self, mock_pdf_reader_cls):
+        mock_reader = mock_pdf_reader_cls.return_value
+        mock_reader.is_encrypted = True
+        
+        data = {'pdf_file': (io.BytesIO(b'encryptedpdf'), 'statement.pdf')}
+        response = self.client.post('/preview-pdf', data=data, content_type='multipart/form-data')
+        self.assertEqual(response.status_code, 401)
+        json_data = response.get_json()
+        self.assertEqual(json_data['error'], 'password_required')
+
+    @patch('parser.pypdf.PdfReader')
+    def test_preview_pdf_invalid_password(self, mock_pdf_reader_cls):
+        mock_reader = mock_pdf_reader_cls.return_value
+        mock_reader.is_encrypted = True
+        mock_reader.decrypt.return_value = 0
+        
+        data = {
+            'pdf_file': (io.BytesIO(b'encryptedpdf'), 'statement.pdf'),
+            'password': 'wrong_password'
+        }
+        response = self.client.post('/preview-pdf', data=data, content_type='multipart/form-data')
+        self.assertEqual(response.status_code, 401)
+        json_data = response.get_json()
+        self.assertEqual(json_data['error'], 'invalid_password')
+        mock_reader.decrypt.assert_called_with('wrong_password')
+
+    @patch('parser.pypdf.PdfReader')
+    def test_import_pdf_password_required(self, mock_pdf_reader_cls):
+        mock_reader = mock_pdf_reader_cls.return_value
+        mock_reader.is_encrypted = True
+        
+        data = {'pdf_file': (io.BytesIO(b'encryptedpdf'), 'statement.pdf')}
+        response = self.client.post('/import-pdf-statement', data=data, content_type='multipart/form-data')
+        self.assertEqual(response.status_code, 401)
+        json_data = response.get_json()
+        self.assertEqual(json_data['error'], 'password_required')
+
+    @patch('parser.pypdf.PdfReader')
+    def test_import_pdf_invalid_password(self, mock_pdf_reader_cls):
+        mock_reader = mock_pdf_reader_cls.return_value
+        mock_reader.is_encrypted = True
+        mock_reader.decrypt.return_value = 0
+        
+        data = {
+            'pdf_file': (io.BytesIO(b'encryptedpdf'), 'statement.pdf'),
+            'password': 'wrong_password'
+        }
+        response = self.client.post('/import-pdf-statement', data=data, content_type='multipart/form-data')
+        self.assertEqual(response.status_code, 401)
+        json_data = response.get_json()
+        self.assertEqual(json_data['error'], 'invalid_password')
+        mock_reader.decrypt.assert_called_with('wrong_password')
+
 
 if __name__ == '__main__':
     unittest.main()
